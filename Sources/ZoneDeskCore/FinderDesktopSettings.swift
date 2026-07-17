@@ -42,4 +42,38 @@ public enum FinderDesktopSettings {
 
         return updated
     }
+
+    public static func iconLayout(from desktopViewSettings: [String: Any]) -> FinderDesktopIconLayout {
+        let iconSettings = desktopViewSettings["IconViewSettings"] as? [String: Any] ?? [:]
+        let fallback = FinderDesktopIconLayout.finderDefault
+
+        return FinderDesktopIconLayout(
+            iconSize: validNumber(iconSettings["iconSize"], range: 16...256) ?? fallback.iconSize,
+            gridSpacing: validNumber(iconSettings["gridSpacing"], range: 0...256) ?? fallback.gridSpacing,
+            textSize: validNumber(iconSettings["textSize"], range: 8...72) ?? fallback.textSize
+        )
+    }
+
+    private static func validNumber(_ value: Any?, range: ClosedRange<Double>) -> Double? {
+        guard !(value is Bool) else {
+            return nil
+        }
+
+        let number: Double?
+        switch value {
+        case let value as Double:
+            number = value
+        case let value as Int:
+            number = Double(value)
+        case let value as NSNumber:
+            number = value.doubleValue
+        default:
+            number = nil
+        }
+
+        guard let number, number.isFinite, range.contains(number) else {
+            return nil
+        }
+        return number
+    }
 }
