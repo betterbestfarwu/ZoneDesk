@@ -737,7 +737,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
             onPresentError?("无法获取快速查看控制权。")
             return
         }
-        beginPreviewPanelControl(panel)
+        configureQuickLookPanel(panel)
         panel.makeKeyAndOrderFront(nil)
     }
 
@@ -746,6 +746,10 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
     }
 
     override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        configureQuickLookPanel(panel)
+    }
+
+    private func configureQuickLookPanel(_ panel: QLPreviewPanel) {
         guard let quickLookDataSource else {
             return
         }

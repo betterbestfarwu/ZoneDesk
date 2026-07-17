@@ -119,6 +119,27 @@ struct ZoneFilesViewSelectionTests {
         #expect(view.quickLookDataSourceForTesting == nil)
     }
 
+    @Test("Quick Look presentation leaves lifecycle callbacks to the framework")
+    func quickLookPresentationDoesNotInvokeLifecycleCallback() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(contentsOf: packageRoot.appendingPathComponent(
+            "Sources/ZoneDeskApp/main.swift"
+        ))
+        let methodStart = try #require(source.range(
+            of: "    func presentQuickLook(url: URL) {"
+        ))
+        let methodEnd = try #require(source.range(
+            of: "\n    override func acceptsPreviewPanelControl",
+            range: methodStart.upperBound..<source.endIndex
+        ))
+        let methodBody = source[methodStart.lowerBound..<methodEnd.lowerBound]
+
+        #expect(!methodBody.contains("beginPreviewPanelControl"))
+    }
+
     @Test("WindowManager routes menu actions with the captured zone identifier")
     func windowManagerRoutesCapturedZoneID() {
         let manager = WindowManager()
