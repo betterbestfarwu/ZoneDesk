@@ -433,7 +433,7 @@ func selectionRects(at index: Int) -> (icon: NSRect, title: NSRect)? {
 }
 ```
 
-选中图标使用 `NSColor.unemphasizedSelectedContentBackgroundColor.withAlphaComponent(0.24)` 圆角填充和白色半透明细边框；选中文件名使用 `NSColor.unemphasizedSelectedContentBackgroundColor.withAlphaComponent(0.88)` 圆角填充和白色文字。未选中项不绘制背景。标题字体改为 `NSFont.systemFont(ofSize: CGFloat(fileLayout.textSize))`，最多保留两行高度。
+选中图标使用 `NSColor.black.withAlphaComponent(0.28)` 圆角填充和 `NSColor.white.withAlphaComponent(0.42)` 细边框，形成系统截图中的半透明深色图标框；选中文件名使用 `NSColor.controlAccentColor` 圆角填充和白色文字，背景宽度紧贴实际文字而不是占满单元格。未选中项不绘制背景。标题字体改为 `NSFont.systemFont(ofSize: CGFloat(fileLayout.textSize), weight: .medium)`，最多保留两行高度。
 
 - [ ] **Step 6: 运行视图选择测试确认 GREEN**
 
@@ -657,7 +657,7 @@ Expected: 工作树干净。
 启动应用后逐项确认：
 
 1. 当前 Finder 设置为 `iconSize=64`、`gridSpacing=54`、`textSize=12` 时，分区图标、文字和网格密度与桌面一致。
-2. 单击分区文件后，只有图标区域和文件名标签出现系统灰色选中背景。
+2. 单击分区文件后，只有图标区域出现半透明深色圆角框，文件名出现紧贴文字的系统蓝色圆角标签。
 3. 将鼠标移出分区，选中效果仍保留。
 4. 单击另一个文件时选择切换；单击空白处时选择清除；双击文件仍打开。
 5. 修改 Finder 桌面图标大小或网格间距后，触发“重新显示分区”或文件刷新，分区布局采用新设置。
