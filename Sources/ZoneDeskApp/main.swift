@@ -390,6 +390,22 @@ final class ZoneScrollView: NSScrollView {
     }
 }
 
+private struct ZoneFileRenameValidationError: LocalizedError {
+    let name: String
+
+    var errorDescription: String? {
+        "The name “\(name)” is not valid. Use a non-empty name without path separators."
+    }
+}
+
+private final class ZoneFileThumbnailPayload: @unchecked Sendable {
+    let image: NSImage?
+
+    init(_ image: NSImage?) {
+        self.image = image
+    }
+}
+
 final class ZoneFilesView: NSView, NSTextFieldDelegate {
     private struct Cell {
         var file: ZoneStoredFile
@@ -408,6 +424,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
     private var thumbnailGeneration = 0
     private var renameEditor: NSTextField?
     private var renamingFileURL: URL?
+    private weak var renameCommandEditor: NSTextField?
     private(set) var selectedFileURL: URL?
 
     var thumbnailProvider: ZoneFileThumbnailProviding = ZoneFileThumbnailProvider() {
@@ -642,9 +659,10 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
 
     func cancelRenaming() {
         let editedURL = renamingFileURL
-        renameEditor?.removeFromSuperview()
+        let editor = renameEditor
         renameEditor = nil
         renamingFileURL = nil
+        editor?.removeFromSuperview()
         if let editedURL,
            let cell = cells.first(where: { $0.file.url == editedURL }) {
             setNeedsDisplay(cell.frame)
@@ -653,8 +671,20 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
 
     func commitRenaming() {
         guard let editor = renameEditor,
-              let renamingFileURL,
-              let onRenameFile else {
+              let renamingFileURL else {
+            cancelRenaming()
+            return
+        }
+
+        guard isValidRename(editor.stringValue) else {
+            keepRenameEditorActive(
+                editor,
+                error: ZoneFileRenameValidationError(name: editor.stringValue)
+            )
+            return
+        }
+
+        guard let onRenameFile else {
             cancelRenaming()
             return
         }
@@ -665,9 +695,24 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
             selectedFileURL = renamedURL
             needsDisplay = true
         case let .failure(error):
-            onPresentError?(error.localizedDescription)
-            window?.makeFirstResponder(editor)
+            keepRenameEditorActive(editor, error: error)
         }
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard let editor = notification.object as? NSTextField,
+              editor === renameEditor else {
+            return
+        }
+        guard editor !== renameCommandEditor else {
+            return
+        }
+        if let movementNumber = notification.userInfo?[NSText.movementUserInfoKey] as? NSNumber,
+           let movement = NSTextMovement(rawValue: movementNumber.intValue),
+           movement == .return || movement == .cancel {
+            return
+        }
+        commitRenaming()
     }
 
     func control(
@@ -675,15 +720,57 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         textView: NSTextView,
         doCommandBy commandSelector: Selector
     ) -> Bool {
+        guard let editor = control as? NSTextField else {
+            return false
+        }
         switch commandSelector {
         case #selector(NSResponder.insertNewline(_:)):
+            ignoreEndEditingDuringCommand(from: editor)
             commitRenaming()
             return true
         case #selector(NSResponder.cancelOperation(_:)):
+            ignoreEndEditingDuringCommand(from: editor)
             cancelRenaming()
             return true
         default:
             return false
+        }
+    }
+
+    private func ignoreEndEditingDuringCommand(from editor: NSTextField) {
+        renameCommandEditor = editor
+        DispatchQueue.main.async { [weak self, weak editor] in
+            guard let self,
+                  let editor,
+                  self.renameCommandEditor === editor else {
+                return
+            }
+            self.renameCommandEditor = nil
+        }
+    }
+
+    private func isValidRename(_ name: String) -> Bool {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmedName.isEmpty
+            && !name.contains("/")
+            && name != "."
+            && name != ".."
+    }
+
+    private func keepRenameEditorActive(_ editor: NSTextField, error: Error) {
+        guard editor === renameEditor else {
+            return
+        }
+        onPresentError?(error.localizedDescription)
+        window?.makeFirstResponder(editor)
+        DispatchQueue.main.async { [weak self, weak editor] in
+            guard let self,
+                  let editor,
+                  editor === self.renameEditor else {
+                return
+            }
+            self.window?.makeFirstResponder(editor)
+            editor.selectText(nil)
         }
     }
 
@@ -717,7 +804,14 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         )
         let columns = max(1, Int((bounds.width - edgeInset) / cellSize))
         frame.size.height = requiredHeight(forWidth: bounds.width)
-        let previousCells = cells
+        let previousThumbnailStates = Dictionary(
+            cells.compactMap { cell in
+                cell.thumbnailRequestKey.map { key in
+                    (key, (thumbnail: cell.thumbnail, requestKey: key))
+                }
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
         cells = files.enumerated().map { index, file in
             let row = index / columns
             let column = index % columns
@@ -751,9 +845,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
                 y: titleBackgroundFrame.minY + 1 - titleLayout.textBounds.minY
             )
             let requestKey = thumbnailRequestKey(for: file, size: iconFrame.size)
-            let previousCell = previousCells.first {
-                $0.thumbnailRequestKey == requestKey
-            }
+            let previousState = requestKey.flatMap { previousThumbnailStates[$0] }
             return Cell(
                 file: file,
                 frame: frame,
@@ -761,8 +853,8 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
                 titleLayout: titleLayout,
                 titleDrawOrigin: titleDrawOrigin,
                 titleBackgroundFrame: titleBackgroundFrame,
-                thumbnail: previousCell?.thumbnail,
-                thumbnailRequestKey: previousCell?.thumbnailRequestKey
+                thumbnail: previousState?.thumbnail,
+                thumbnailRequestKey: previousState?.requestKey
             )
         }
         requestThumbnails()
@@ -802,19 +894,42 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
                 for: file,
                 size: requestedSize
             ) { [weak self] image in
-                guard let self,
-                      self.thumbnailGeneration == generation,
-                      let matchingIndex = self.cells.firstIndex(where: {
-                          $0.file.url == requestKey.url
-                              && $0.file.modificationDate == requestKey.modificationDate
-                              && $0.thumbnailRequestKey == requestKey
-                      }) else {
+                guard !Thread.isMainThread else {
+                    self?.applyThumbnail(
+                        image,
+                        requestKey: requestKey,
+                        generation: generation
+                    )
                     return
                 }
-                self.cells[matchingIndex].thumbnail = image
-                self.setNeedsDisplay(self.cells[matchingIndex].frame)
+                let payload = ZoneFileThumbnailPayload(image)
+                DispatchQueue.main.async { [weak self] in
+                    self?.applyThumbnail(
+                        payload.image,
+                        requestKey: requestKey,
+                        generation: generation
+                    )
+                }
             }
         }
+    }
+
+    private func applyThumbnail(
+        _ image: NSImage?,
+        requestKey: ZoneFileThumbnailCacheKey,
+        generation: Int
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard thumbnailGeneration == generation,
+              let matchingIndex = cells.firstIndex(where: {
+                  $0.file.url.standardizedFileURL == requestKey.url
+                      && $0.file.modificationDate == requestKey.modificationDate
+                      && $0.thumbnailRequestKey == requestKey
+              }) else {
+            return
+        }
+        cells[matchingIndex].thumbnail = image
+        setNeedsDisplay(cells[matchingIndex].frame)
     }
 
     private func aspectFitRect(for image: NSImage, inside rect: NSRect) -> NSRect {

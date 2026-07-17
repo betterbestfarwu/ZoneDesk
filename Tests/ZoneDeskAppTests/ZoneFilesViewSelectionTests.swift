@@ -64,11 +64,98 @@ struct ZoneFilesViewSelectionTests {
         ])
         fixture.view.layoutSubtreeIfNeeded()
         provider.complete(
-            url: oldURL,
+            requestAt: 0,
             image: makeSolidImage(size: NSSize(width: 32, height: 32))
         )
 
         #expect(fixture.view.displayedThumbnailURL(at: 0) != oldURL)
+    }
+
+    @Test("stale thumbnail completion is rejected after modification date changes")
+    func staleThumbnailModificationDateIsIgnored() throws {
+        let provider = DeferredThumbnailProvider()
+        let fixture = try ZoneFilesViewFixture(fileCount: 0, thumbnailProvider: provider)
+        let url = URL(fileURLWithPath: "/tmp/photo.png")
+        fixture.view.setFiles([
+            ZoneStoredFile(
+                url: url,
+                displayName: "photo.png",
+                category: .image,
+                modificationDate: Date(timeIntervalSince1970: 1)
+            ),
+        ])
+        fixture.view.layoutSubtreeIfNeeded()
+
+        fixture.view.setFiles([
+            ZoneStoredFile(
+                url: url,
+                displayName: "photo.png",
+                category: .image,
+                modificationDate: Date(timeIntervalSince1970: 2)
+            ),
+        ])
+        fixture.view.layoutSubtreeIfNeeded()
+        provider.complete(
+            requestAt: 0,
+            image: makeSolidImage(size: NSSize(width: 32, height: 32))
+        )
+
+        #expect(provider.requests.map(\.key.modificationDate) == [
+            Date(timeIntervalSince1970: 1),
+            Date(timeIntervalSince1970: 2),
+        ])
+        #expect(fixture.view.displayedThumbnailURL(at: 0) == nil)
+    }
+
+    @Test("stale thumbnail completion is rejected after icon size changes")
+    func staleThumbnailSizeIsIgnored() throws {
+        let provider = DeferredThumbnailProvider()
+        let fixture = try ZoneFilesViewFixture(fileCount: 0, thumbnailProvider: provider)
+        let file = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/photo.png"),
+            displayName: "photo.png",
+            category: .image
+        )
+        fixture.view.setFiles(
+            [file],
+            layout: FinderDesktopIconLayout(iconSize: 48, gridSpacing: 46, textSize: 12)
+        )
+        fixture.view.layoutSubtreeIfNeeded()
+
+        fixture.view.setFiles(
+            [file],
+            layout: FinderDesktopIconLayout(iconSize: 72, gridSpacing: 46, textSize: 12)
+        )
+        fixture.view.layoutSubtreeIfNeeded()
+        provider.complete(
+            requestAt: 0,
+            image: makeSolidImage(size: NSSize(width: 32, height: 32))
+        )
+
+        #expect(provider.requests.map(\.key.pixelWidth) == [48, 72])
+        #expect(fixture.view.displayedThumbnailURL(at: 0) == nil)
+    }
+
+    @Test("background thumbnail completion is applied safely on main")
+    func backgroundThumbnailCompletionUsesMainThread() async throws {
+        let provider = DeferredThumbnailProvider()
+        let fixture = try ZoneFilesViewFixture(fileCount: 0, thumbnailProvider: provider)
+        let url = URL(fileURLWithPath: "/tmp/photo.png")
+        fixture.view.setFiles([
+            ZoneStoredFile(url: url, displayName: "photo.png", category: .image),
+        ])
+        fixture.view.layoutSubtreeIfNeeded()
+
+        await provider.completeInBackground(
+            requestAt: 0,
+            image: makeSolidImage(size: NSSize(width: 32, height: 32))
+        )
+        for _ in 0..<20 where fixture.view.displayedThumbnailURL(at: 0) == nil {
+            await Task.yield()
+        }
+
+        #expect(provider.completionThreadWasMain == false)
+        #expect(fixture.view.displayedThumbnailURL(at: 0) == url)
     }
 
     @Test("thumbnail drawing preserves its aspect ratio")
@@ -225,6 +312,132 @@ struct ZoneFilesViewSelectionTests {
             doCommandBy: #selector(NSResponder.cancelOperation(_:))
         ))
         #expect(!fixture.view.isRenamingFile)
+    }
+
+    @Test("losing focus commits a valid inline rename")
+    func renameCommitsWhenFocusIsLost() throws {
+        let fixture = try ZoneFilesViewFixture(fileCount: 1)
+        var submittedNames: [String] = []
+        fixture.view.onRenameFile = { url, name in
+            submittedNames.append(name)
+            return .success(url.deletingLastPathComponent().appendingPathComponent(name))
+        }
+        fixture.view.beginRenaming(url: fixture.files[0].url)
+        fixture.view.renameEditorStringValue = "focused.pdf"
+
+        fixture.window.makeFirstResponder(nil)
+
+        #expect(submittedNames == ["focused.pdf"])
+        #expect(!fixture.view.isRenamingFile)
+    }
+
+    @Test("losing focus keeps a rejected rename active and restores focus")
+    func rejectedRenameRestoresFocus() async throws {
+        let fixture = try ZoneFilesViewFixture(fileCount: 1)
+        var presentedMessage: String?
+        fixture.view.onRenameFile = { _, _ in .failure(RenameTestError.rejected) }
+        fixture.view.onPresentError = { presentedMessage = $0 }
+        fixture.view.beginRenaming(url: fixture.files[0].url)
+        let editor = try #require(fixture.renameField)
+        fixture.view.renameEditorStringValue = "rejected.pdf"
+
+        fixture.window.makeFirstResponder(nil)
+        await waitForMainQueue()
+
+        #expect(fixture.view.isRenamingFile)
+        #expect(presentedMessage == RenameTestError.rejected.localizedDescription)
+        #expect(editor.currentEditor() != nil)
+    }
+
+    @Test("losing focus rejects an invalid name before the mutation callback")
+    func invalidRenameRestoresFocus() async throws {
+        let fixture = try ZoneFilesViewFixture(fileCount: 1)
+        var callbackCount = 0
+        var presentedMessage: String?
+        fixture.view.onRenameFile = { url, _ in
+            callbackCount += 1
+            return .success(url)
+        }
+        fixture.view.onPresentError = { presentedMessage = $0 }
+        fixture.view.beginRenaming(url: fixture.files[0].url)
+        let editor = try #require(fixture.renameField)
+        fixture.view.renameEditorStringValue = "../outside"
+
+        fixture.window.makeFirstResponder(nil)
+        await waitForMainQueue()
+
+        #expect(callbackCount == 0)
+        #expect(presentedMessage != nil)
+        #expect(fixture.view.isRenamingFile)
+        #expect(editor.currentEditor() != nil)
+    }
+
+    @Test("Return and Escape ignore a following end-editing notification")
+    func renameCommandsDoNotResolveTwice() throws {
+        let fixture = try ZoneFilesViewFixture(fileCount: 1)
+        var commitCount = 0
+        fixture.view.onRenameFile = { url, _ in
+            commitCount += 1
+            return .success(url)
+        }
+        fixture.view.beginRenaming(url: fixture.files[0].url)
+        let returnField = try #require(fixture.renameField)
+        let returnEditor = try #require(returnField.currentEditor() as? NSTextView)
+        _ = fixture.view.control(
+            returnField,
+            textView: returnEditor,
+            doCommandBy: #selector(NSResponder.insertNewline(_:))
+        )
+        fixture.view.controlTextDidEndEditing(Notification(
+            name: NSControl.textDidEndEditingNotification,
+            object: returnField
+        ))
+
+        #expect(commitCount == 1)
+
+        fixture.view.beginRenaming(url: fixture.files[0].url)
+        let escapeField = try #require(fixture.renameField)
+        let escapeEditor = try #require(escapeField.currentEditor() as? NSTextView)
+        _ = fixture.view.control(
+            escapeField,
+            textView: escapeEditor,
+            doCommandBy: #selector(NSResponder.cancelOperation(_:))
+        )
+        fixture.view.controlTextDidEndEditing(Notification(
+            name: NSControl.textDidEndEditingNotification,
+            object: escapeField
+        ))
+
+        #expect(commitCount == 1)
+        #expect(!fixture.view.isRenamingFile)
+    }
+
+    @Test("a rejected Return ignores its end-editing notification")
+    func rejectedReturnDoesNotSubmitTwice() throws {
+        let fixture = try ZoneFilesViewFixture(fileCount: 1)
+        var commitCount = 0
+        fixture.view.onRenameFile = { _, _ in
+            commitCount += 1
+            return .failure(RenameTestError.rejected)
+        }
+        fixture.view.beginRenaming(url: fixture.files[0].url)
+        let field = try #require(fixture.renameField)
+        let fieldEditor = try #require(field.currentEditor() as? NSTextView)
+        _ = fixture.view.control(
+            field,
+            textView: fieldEditor,
+            doCommandBy: #selector(NSResponder.insertNewline(_:))
+        )
+        fixture.view.controlTextDidEndEditing(Notification(
+            name: NSControl.textDidEndEditingNotification,
+            object: field,
+            userInfo: [
+                NSText.movementUserInfoKey: NSTextMovement.return.rawValue,
+            ]
+        ))
+
+        #expect(commitCount == 1)
+        #expect(fixture.view.isRenamingFile)
     }
 
     @Test("selection survives mouse exit and changes only on an explicit click")
@@ -402,6 +615,15 @@ private func changedPixelCount(
 }
 
 @MainActor
+private func waitForMainQueue() async {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.main.async {
+            continuation.resume()
+        }
+    }
+}
+
+@MainActor
 private func makeSolidImage(
     size: NSSize,
     color: NSColor = .systemBlue
@@ -481,21 +703,60 @@ private final class ImmediateThumbnailProvider: ZoneFileThumbnailProviding {
 
 @MainActor
 private final class DeferredThumbnailProvider: ZoneFileThumbnailProviding {
-    private(set) var requestedURLs: [URL] = []
-    private var completions: [URL: [(NSImage?) -> Void]] = [:]
+    private final class ImagePayload: @unchecked Sendable {
+        let image: NSImage?
+
+        init(_ image: NSImage?) {
+            self.image = image
+        }
+    }
+
+    struct Request {
+        let key: ZoneFileThumbnailCacheKey
+        let completion: (NSImage?) -> Void
+    }
+
+    private(set) var requests: [Request] = []
+    private(set) var completionThreadWasMain: Bool?
+
+    var requestedURLs: [URL] {
+        requests.map(\.key.url)
+    }
 
     func thumbnail(
         for file: ZoneStoredFile,
         size: NSSize,
         completion: @escaping (NSImage?) -> Void
     ) {
-        requestedURLs.append(file.url)
-        completions[file.url, default: []].append(completion)
+        requests.append(Request(
+            key: ZoneFileThumbnailCacheKey(
+                url: file.url,
+                modificationDate: file.modificationDate,
+                pixelWidth: Int(ceil(size.width)),
+                pixelHeight: Int(ceil(size.height))
+            ),
+            completion: completion
+        ))
     }
 
-    func complete(url: URL, image: NSImage?) {
-        let callbacks = completions.removeValue(forKey: url) ?? []
-        callbacks.forEach { $0(image) }
+    func complete(requestAt index: Int, image: NSImage?) {
+        completionThreadWasMain = Thread.isMainThread
+        requests[index].completion(image)
+    }
+
+    func completeInBackground(requestAt index: Int, image: NSImage?) async {
+        let completion = requests[index].completion
+        let payload = ImagePayload(image)
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let wasMain = Thread.isMainThread
+                completion(payload.image)
+                DispatchQueue.main.async {
+                    self?.completionThreadWasMain = wasMain
+                    continuation.resume()
+                }
+            }
+        }
     }
 }
 
