@@ -4,6 +4,39 @@ import Testing
 
 @Suite("Zone library")
 struct ZoneLibraryTests {
+    @Test("duplicates stored items and chooses available sibling destinations")
+    func duplicatesStoredItemsAndChoosesAvailableSiblingDestinations() throws {
+        let fixture = try TemporaryZoneLibraryFixture()
+        defer { fixture.cleanUp() }
+        let zone = fixture.zone(name: "资料", categories: [.other])
+        let report = try fixture.writeZoneFile(named: "report.pdf", in: zone)
+        let folder = try fixture.library.createFolder(in: zone, preferredName: "Folder")
+        _ = try fixture.writeZoneFile(named: "report 副本.pdf", in: zone)
+        _ = try fixture.writeZoneFile(named: "Folder.zip", in: zone)
+        _ = try fixture.writeZoneFile(named: "Folder 的替身", in: zone)
+
+        let fileCopy = try fixture.library.duplicateStoredItem(at: report, in: zone)
+        let folderCopy = try fixture.library.duplicateStoredItem(at: folder, in: zone)
+
+        #expect(fileCopy.lastPathComponent == "report 副本 2.pdf")
+        #expect(try String(contentsOf: fileCopy) == "fixture")
+        #expect(folderCopy.lastPathComponent == "Folder 副本")
+        #expect(FileManager.default.fileExists(atPath: folderCopy.path))
+        #expect(
+            try fixture.library.archiveDestination(for: folder, in: zone).lastPathComponent
+                == "Folder 2.zip"
+        )
+        #expect(
+            try fixture.library.aliasDestination(for: folder, in: zone).lastPathComponent
+                == "Folder 的替身 2"
+        )
+
+        let outside = try fixture.writeDesktopFile(named: "outside.txt")
+        #expect(throws: ZoneLibraryError.sourceOutsideZone(outside)) {
+            try fixture.library.duplicateStoredItem(at: outside, in: zone)
+        }
+    }
+
     @Test("creates uniquely named folders and renames without overwriting")
     func createsAndRenamesStoredItemsSafely() throws {
         let fixture = try TemporaryZoneLibraryFixture()

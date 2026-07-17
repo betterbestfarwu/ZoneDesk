@@ -437,6 +437,45 @@ public struct ZoneLibrary {
         return destination
     }
 
+    public func duplicateStoredItem(at source: URL, in zone: ZoneModel) throws -> URL {
+        let source = try validatedStoredItem(source, in: zone)
+        var isDirectory: ObjCBool = false
+        _ = fileManager.fileExists(atPath: source.path, isDirectory: &isDirectory)
+        let sourceIsDirectory = isDirectory.boolValue
+        let destination = availableSiblingURL(
+            in: source.deletingLastPathComponent(),
+            stem: sourceIsDirectory ? source.lastPathComponent : source.deletingPathExtension().lastPathComponent,
+            pathExtension: sourceIsDirectory ? "" : source.pathExtension,
+            firstSuffix: " 副本",
+            isDirectory: sourceIsDirectory
+        )
+
+        try fileManager.copyItem(at: source, to: destination)
+        return destination
+    }
+
+    public func archiveDestination(for source: URL, in zone: ZoneModel) throws -> URL {
+        let source = try validatedStoredItem(source, in: zone)
+        return availableSiblingURL(
+            in: source.deletingLastPathComponent(),
+            stem: source.lastPathComponent,
+            pathExtension: "zip",
+            firstSuffix: "",
+            isDirectory: false
+        )
+    }
+
+    public func aliasDestination(for source: URL, in zone: ZoneModel) throws -> URL {
+        let source = try validatedStoredItem(source, in: zone)
+        return availableSiblingURL(
+            in: source.deletingLastPathComponent(),
+            stem: source.lastPathComponent,
+            pathExtension: "",
+            firstSuffix: " 的替身",
+            isDirectory: false
+        )
+    }
+
     public func collectDesktopFiles(from desktopURL: URL, zones: [ZoneModel]) -> ZoneCollectionReport {
         var moves: [ZoneCollectionMove] = []
         var failures: [ZoneCollectionFailure] = []
@@ -566,6 +605,40 @@ public struct ZoneLibrary {
         return name
             .components(separatedBy: invalidCharacters)
             .joined(separator: "-")
+    }
+
+    private func validatedStoredItem(_ source: URL, in zone: ZoneModel) throws -> URL {
+        let directory = directoryURL(for: zone).standardizedFileURL
+        let standardizedSource = source.standardizedFileURL
+        guard standardizedSource.deletingLastPathComponent() == directory else {
+            throw ZoneLibraryError.sourceOutsideZone(source)
+        }
+        return standardizedSource
+    }
+
+    private func availableSiblingURL(
+        in directory: URL,
+        stem: String,
+        pathExtension: String,
+        firstSuffix: String,
+        isDirectory: Bool
+    ) -> URL {
+        var index = 1
+
+        while true {
+            let suffix = index == 1 ? firstSuffix : "\(firstSuffix) \(index)"
+            let candidateName = pathExtension.isEmpty
+                ? "\(stem)\(suffix)"
+                : "\(stem)\(suffix).\(pathExtension)"
+            let candidate = directory.appendingPathComponent(
+                candidateName,
+                isDirectory: isDirectory
+            )
+            if !fileManager.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+            index += 1
+        }
     }
 
     private func renameCaseOnlyStoredItem(
