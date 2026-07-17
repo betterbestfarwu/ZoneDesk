@@ -4,6 +4,65 @@ import Testing
 
 @Suite("Zone library")
 struct ZoneLibraryTests {
+    @Test("creates uniquely named folders and renames without overwriting")
+    func createsAndRenamesStoredItemsSafely() throws {
+        let fixture = try TemporaryZoneLibraryFixture()
+        defer { fixture.cleanUp() }
+        let zone = fixture.zone(name: "资料", categories: [.other])
+        let first = try fixture.library.createFolder(in: zone, preferredName: "新建文件夹")
+        let second = try fixture.library.createFolder(in: zone, preferredName: "新建文件夹")
+        let source = try fixture.writeZoneFile(named: "draft.txt", in: zone)
+        try Data().write(to: fixture.library.directoryURL(for: zone).appendingPathComponent("taken.txt"))
+
+        let renamed = try fixture.library.renameStoredItem(at: source, to: "final.txt", in: zone)
+
+        #expect(first.lastPathComponent == "新建文件夹")
+        #expect(second.lastPathComponent == "新建文件夹 2")
+        #expect(renamed.lastPathComponent == "final.txt")
+        let occupied = fixture.library.directoryURL(for: zone).appendingPathComponent("taken.txt")
+        #expect(throws: ZoneLibraryError.destinationItemExists(occupied)) {
+            try fixture.library.renameStoredItem(at: renamed, to: "taken.txt", in: zone)
+        }
+    }
+
+    @Test("loads stored file metadata")
+    func loadsStoredFileMetadata() throws {
+        let fixture = try TemporaryZoneLibraryFixture()
+        defer { fixture.cleanUp() }
+        let zone = fixture.zone(name: "资料", categories: [.other])
+        _ = try fixture.writeZoneFile(named: "notes.txt", contents: "fixture", in: zone)
+        _ = try fixture.library.createFolder(in: zone, preferredName: "Folder")
+
+        let files = try fixture.library.files(in: zone)
+        let folder = try #require(files.first { $0.displayName == "Folder" })
+        let notes = try #require(files.first { $0.displayName == "notes.txt" })
+
+        #expect(folder.isDirectory)
+        #expect(notes.fileSize == 7)
+        #expect(notes.modificationDate != nil)
+        #expect(notes.creationDate != nil)
+        #expect(notes.tagNames.isEmpty)
+    }
+
+    @Test("rejects invalid rename names and sources outside the zone")
+    func rejectsInvalidRenameInputs() throws {
+        let fixture = try TemporaryZoneLibraryFixture()
+        defer { fixture.cleanUp() }
+        let zone = fixture.zone(name: "资料", categories: [.other])
+        let source = try fixture.writeZoneFile(named: "draft.txt", in: zone)
+
+        for invalidName in ["", "   ", ".", "..", "nested/name"] {
+            #expect(throws: ZoneLibraryError.invalidItemName(invalidName)) {
+                try fixture.library.renameStoredItem(at: source, to: invalidName, in: zone)
+            }
+        }
+
+        let outsideSource = try fixture.writeDesktopFile(named: "outside.txt")
+        #expect(throws: ZoneLibraryError.sourceOutsideZone(outsideSource)) {
+            try fixture.library.renameStoredItem(at: outsideSource, to: "inside.txt", in: zone)
+        }
+    }
+
     @Test("creates a new zone directory without merging an existing path")
     func createsZoneDirectoryExclusively() throws {
         let fixture = try TemporaryZoneLibraryFixture()

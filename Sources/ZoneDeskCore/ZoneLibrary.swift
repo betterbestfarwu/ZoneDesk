@@ -4,11 +4,36 @@ public struct ZoneStoredFile: Equatable, Sendable {
     public var url: URL
     public var displayName: String
     public var category: FileCategory
+    public var isDirectory: Bool
+    public var fileSize: Int?
+    public var lastOpenedDate: Date?
+    public var dateAdded: Date?
+    public var modificationDate: Date?
+    public var creationDate: Date?
+    public var tagNames: [String]
 
-    public init(url: URL, displayName: String, category: FileCategory) {
+    public init(
+        url: URL,
+        displayName: String,
+        category: FileCategory,
+        isDirectory: Bool = false,
+        fileSize: Int? = nil,
+        lastOpenedDate: Date? = nil,
+        dateAdded: Date? = nil,
+        modificationDate: Date? = nil,
+        creationDate: Date? = nil,
+        tagNames: [String] = []
+    ) {
         self.url = url
         self.displayName = displayName
         self.category = category
+        self.isDirectory = isDirectory
+        self.fileSize = fileSize
+        self.lastOpenedDate = lastOpenedDate
+        self.dateAdded = dateAdded
+        self.modificationDate = modificationDate
+        self.creationDate = creationDate
+        self.tagNames = tagNames
     }
 }
 
@@ -80,11 +105,20 @@ public struct ZoneRestoreReport: Equatable, Sendable {
 
 public enum ZoneLibraryError: Error, Equatable, CustomStringConvertible {
     case destinationDirectoryExists(URL)
+    case invalidItemName(String)
+    case destinationItemExists(URL)
+    case sourceOutsideZone(URL)
 
     public var description: String {
         switch self {
         case let .destinationDirectoryExists(url):
             return "Destination zone directory already exists: \(url.path)"
+        case let .invalidItemName(name):
+            return "Invalid stored item name: \(name)"
+        case let .destinationItemExists(url):
+            return "Destination item already exists: \(url.path)"
+        case let .sourceOutsideZone(url):
+            return "Source item is outside the zone directory: \(url.path)"
         }
     }
 }
@@ -151,24 +185,86 @@ public struct ZoneLibrary {
 
     public func files(in zone: ZoneModel) throws -> [ZoneStoredFile] {
         let directory = try ensureDirectory(for: zone)
+        let resourceKeys: Set<URLResourceKey> = [
+            .isHiddenKey,
+            .isDirectoryKey,
+            .fileSizeKey,
+            .contentAccessDateKey,
+            .addedToDirectoryDateKey,
+            .contentModificationDateKey,
+            .creationDateKey,
+            .tagNamesKey,
+        ]
         let urls = try fileManager.contentsOfDirectory(
             at: directory,
-            includingPropertiesForKeys: [.isHiddenKey],
+            includingPropertiesForKeys: Array(resourceKeys),
             options: [.skipsPackageDescendants]
         )
 
-        return urls.compactMap { url in
+        return try urls.compactMap { url in
             guard !url.lastPathComponent.hasPrefix(".") else {
                 return nil
             }
+            let resourceValues = try url.resourceValues(forKeys: resourceKeys)
 
             return ZoneStoredFile(
                 url: url,
                 displayName: url.lastPathComponent,
-                category: DesktopFileClassifier.classify(url: url)
+                category: DesktopFileClassifier.classify(url: url),
+                isDirectory: resourceValues.isDirectory ?? false,
+                fileSize: resourceValues.fileSize,
+                lastOpenedDate: resourceValues.contentAccessDate,
+                dateAdded: resourceValues.addedToDirectoryDate,
+                modificationDate: resourceValues.contentModificationDate,
+                creationDate: resourceValues.creationDate,
+                tagNames: resourceValues.tagNames ?? []
             )
         }
         .sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
+    }
+
+    public func createFolder(in zone: ZoneModel, preferredName: String) throws -> URL {
+        let directory = try ensureDirectory(for: zone)
+        var index = 1
+
+        while true {
+            let candidateName = index == 1 ? preferredName : "\(preferredName) \(index)"
+            let candidate = directory.appendingPathComponent(candidateName, isDirectory: true)
+            if !fileManager.fileExists(atPath: candidate.path) {
+                try fileManager.createDirectory(at: candidate, withIntermediateDirectories: false)
+                return candidate
+            }
+            index += 1
+        }
+    }
+
+    public func renameStoredItem(
+        at source: URL,
+        to newName: String,
+        in zone: ZoneModel
+    ) throws -> URL {
+        let trimmedName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty,
+              !newName.contains("/"),
+              newName != ".",
+              newName != ".."
+        else {
+            throw ZoneLibraryError.invalidItemName(newName)
+        }
+
+        let directory = directoryURL(for: zone).standardizedFileURL
+        let standardizedSource = source.standardizedFileURL
+        guard standardizedSource.deletingLastPathComponent() == directory else {
+            throw ZoneLibraryError.sourceOutsideZone(source)
+        }
+
+        let destination = directory.appendingPathComponent(newName)
+        guard !fileManager.fileExists(atPath: destination.path) else {
+            throw ZoneLibraryError.destinationItemExists(destination)
+        }
+
+        try fileManager.moveItem(at: standardizedSource, to: destination)
+        return destination
     }
 
     public func collectDesktopFiles(from desktopURL: URL, zones: [ZoneModel]) -> ZoneCollectionReport {
