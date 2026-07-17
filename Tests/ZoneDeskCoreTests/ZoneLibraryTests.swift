@@ -25,6 +25,50 @@ struct ZoneLibraryTests {
         }
     }
 
+    @Test("renaming to the identical name is a successful no-op")
+    func identicalRenameIsNoOp() throws {
+        let fixture = try TemporaryZoneLibraryFixture()
+        defer { fixture.cleanUp() }
+        let zone = fixture.zone(name: "资料", categories: [.other])
+        let source = try fixture.writeZoneFile(named: "draft.txt", contents: "original", in: zone)
+
+        let result = try fixture.library.renameStoredItem(
+            at: source,
+            to: source.lastPathComponent,
+            in: zone
+        )
+
+        #expect(result == source.standardizedFileURL)
+        #expect(try String(contentsOf: source) == "original")
+    }
+
+    @Test("case-only rename on a case-insensitive volume uses a unique temporary path")
+    func caseOnlyRenameUsesTwoMoves() throws {
+        let fixture = try TemporaryZoneLibraryFixture()
+        defer { fixture.cleanUp() }
+        let zone = fixture.zone(name: "资料", categories: [.other])
+        let source = try fixture.writeZoneFile(named: "draft.txt", contents: "original", in: zone)
+        var moves: [(URL, URL)] = []
+        let library = ZoneLibrary(
+            rootURL: fixture.rootURL,
+            volumeSupportsCaseSensitiveNames: { _ in false },
+            renameMoveItem: { from, to in
+                moves.append((from, to))
+                try FileManager.default.moveItem(at: from, to: to)
+            }
+        )
+
+        let result = try library.renameStoredItem(at: source, to: "Draft.txt", in: zone)
+
+        #expect(result.lastPathComponent == "Draft.txt")
+        #expect(try String(contentsOf: result) == "original")
+        #expect(moves.count == 2)
+        #expect(moves[0].0 == source.standardizedFileURL)
+        #expect(moves[0].1.lastPathComponent.hasPrefix(".ZoneDesk Rename "))
+        #expect(moves[1].0 == moves[0].1)
+        #expect(moves[1].1 == result)
+    }
+
     @Test("rejects invalid folder names without escaping the zone")
     func rejectsInvalidFolderNames() throws {
         let fixture = try TemporaryZoneLibraryFixture()
@@ -62,6 +106,83 @@ struct ZoneLibraryTests {
         #expect(notes.tagNames.isEmpty)
     }
 
+    @Test("one metadata read failure keeps the item and the rest of the zone")
+    func metadataReadFailureFallsBackPerItem() throws {
+        let fixture = try TemporaryZoneLibraryFixture()
+        defer { fixture.cleanUp() }
+        let zone = fixture.zone(name: "资料", categories: [.other])
+        let readable = try fixture.writeZoneFile(named: "readable.txt", in: zone)
+        let unreadable = try fixture.writeZoneFile(named: "unreadable.txt", in: zone)
+        let library = ZoneLibrary(
+            rootURL: fixture.rootURL,
+            resourceValuesReader: { url, _ in
+                if url.lastPathComponent == unreadable.lastPathComponent {
+                    throw MetadataReaderError.expected
+                }
+                return ZoneFileResourceValues(
+                    isHidden: false,
+                    isDirectory: false,
+                    fileSize: url.lastPathComponent == readable.lastPathComponent ? 7 : nil
+                )
+            }
+        )
+
+        let files = try library.files(in: zone)
+
+        #expect(files.map(\.displayName) == ["readable.txt", "unreadable.txt"])
+        #expect(files.first { $0.displayName == readable.lastPathComponent }?.fileSize == 7)
+        let fallback = try #require(files.first { $0.displayName == unreadable.lastPathComponent })
+        #expect(!fallback.isDirectory)
+        #expect(fallback.fileSize == nil)
+        #expect(fallback.modificationDate == nil)
+        #expect(fallback.tagNames.isEmpty)
+    }
+
+    @Test("an item removed after enumeration is skipped without losing its siblings")
+    func disappearedItemIsSkippedPerItem() throws {
+        let fixture = try TemporaryZoneLibraryFixture()
+        defer { fixture.cleanUp() }
+        let zone = fixture.zone(name: "资料", categories: [.other])
+        let remaining = try fixture.writeZoneFile(named: "remaining.txt", in: zone)
+        let disappearing = try fixture.writeZoneFile(named: "disappearing.txt", in: zone)
+        let library = ZoneLibrary(
+            rootURL: fixture.rootURL,
+            resourceValuesReader: { url, _ in
+                if url.lastPathComponent == disappearing.lastPathComponent {
+                    try FileManager.default.removeItem(at: url)
+                    throw MetadataReaderError.expected
+                }
+                return ZoneFileResourceValues(isHidden: false, isDirectory: false)
+            }
+        )
+
+        let files = try library.files(in: zone)
+
+        #expect(files.map(\.displayName) == [remaining.lastPathComponent])
+    }
+
+    @Test("filters a non-dot item marked hidden by resource metadata")
+    func filtersResourceHiddenItems() throws {
+        let fixture = try TemporaryZoneLibraryFixture()
+        defer { fixture.cleanUp() }
+        let zone = fixture.zone(name: "资料", categories: [.other])
+        let visible = try fixture.writeZoneFile(named: "visible.txt", in: zone)
+        let hidden = try fixture.writeZoneFile(named: "HiddenByFinder.txt", in: zone)
+        let library = ZoneLibrary(
+            rootURL: fixture.rootURL,
+            resourceValuesReader: { url, _ in
+                ZoneFileResourceValues(
+                    isHidden: url.lastPathComponent == hidden.lastPathComponent,
+                    isDirectory: false
+                )
+            }
+        )
+
+        let files = try library.files(in: zone)
+
+        #expect(files.map(\.displayName) == [visible.lastPathComponent])
+    }
+
     @Test("rejects invalid rename names and sources outside the zone")
     func rejectsInvalidRenameInputs() throws {
         let fixture = try TemporaryZoneLibraryFixture()
@@ -79,6 +200,25 @@ struct ZoneLibraryTests {
         #expect(throws: ZoneLibraryError.sourceOutsideZone(outsideSource)) {
             try fixture.library.renameStoredItem(at: outsideSource, to: "inside.txt", in: zone)
         }
+    }
+
+    @Test("rename errors expose actionable localized descriptions")
+    func renameErrorsHaveLocalizedDescriptions() {
+        let occupied = URL(fileURLWithPath: "/Library/Zone/taken.txt")
+        let outside = URL(fileURLWithPath: "/Desktop/outside.txt")
+
+        #expect(
+            ZoneLibraryError.destinationItemExists(occupied).localizedDescription
+                == "Destination item already exists: /Library/Zone/taken.txt"
+        )
+        #expect(
+            ZoneLibraryError.invalidItemName("../escape").localizedDescription
+                == "Invalid stored item name: ../escape"
+        )
+        #expect(
+            ZoneLibraryError.sourceOutsideZone(outside).localizedDescription
+                == "Source item is outside the zone directory: /Desktop/outside.txt"
+        )
     }
 
     @Test("creates a new zone directory without merging an existing path")
@@ -265,6 +405,10 @@ struct ZoneLibraryTests {
         #expect(FileManager.default.fileExists(atPath: source.path))
         #expect(FileManager.default.fileExists(atPath: fixture.library.directoryURL(for: zone).path))
     }
+}
+
+private enum MetadataReaderError: Error {
+    case expected
 }
 
 private struct TemporaryZoneLibraryFixture {

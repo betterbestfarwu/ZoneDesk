@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Testing
 @testable import ZoneDeskApp
 import ZoneDeskCore
@@ -25,6 +26,22 @@ private final class LockedDecodeState: @unchecked Sendable {
 @Suite("Zone file thumbnails")
 @MainActor
 struct ZoneFileThumbnailProviderTests {
+    @Test("video generator requests the exact time-zero frame")
+    func videoGeneratorUsesExactTimeZero() {
+        let generator = AVAssetImageGenerator(asset: AVMutableComposition())
+        let maximumSize = NSSize(width: 120, height: 80)
+
+        ZoneFileThumbnailProvider.configureVideoGenerator(
+            generator,
+            maximumSize: maximumSize
+        )
+
+        #expect(generator.requestedTimeToleranceBefore == .zero)
+        #expect(generator.requestedTimeToleranceAfter == .zero)
+        #expect(generator.appliesPreferredTrackTransform)
+        #expect(generator.maximumSize == maximumSize)
+    }
+
     @Test("cache key changes with modification date and size")
     func cacheKeyIdentity() {
         let url = URL(fileURLWithPath: "/tmp/image.png")

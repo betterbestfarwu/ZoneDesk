@@ -155,7 +155,7 @@ final class ZoneWindow: NSWindow {
             zoneView.onOpenFile = onOpenFile
         }
     }
-    var onRenameFile: ((URL, String) -> Result<URL, Error>)? {
+    var onRenameFile: ((ZoneStoredFile, String) -> Result<URL, Error>)? {
         get { zoneView.onRenameFile }
         set { zoneView.onRenameFile = newValue }
     }
@@ -431,6 +431,39 @@ private final class ZoneFileThumbnailPayload: @unchecked Sendable {
 }
 
 @MainActor
+protocol ZoneQuickLookPanelAdapting: AnyObject {
+    func updateController()
+    func hasCurrentController(_ controller: AnyObject) -> Bool
+    func setDataSource(_ dataSource: QLPreviewPanelDataSource?)
+    func hasDataSource(_ dataSource: QLPreviewPanelDataSource) -> Bool
+    func setCurrentPreviewItemIndex(_ index: Int)
+    func reloadData()
+    func show()
+}
+
+extension QLPreviewPanel: ZoneQuickLookPanelAdapting {
+    func hasCurrentController(_ controller: AnyObject) -> Bool {
+        (currentController as AnyObject?) === controller
+    }
+
+    func setDataSource(_ dataSource: QLPreviewPanelDataSource?) {
+        self.dataSource = dataSource
+    }
+
+    func hasDataSource(_ dataSource: QLPreviewPanelDataSource) -> Bool {
+        (self.dataSource as AnyObject?) === dataSource
+    }
+
+    func setCurrentPreviewItemIndex(_ index: Int) {
+        currentPreviewItemIndex = index
+    }
+
+    func show() {
+        makeKeyAndOrderFront(nil)
+    }
+}
+
+@MainActor
 final class ZoneFilesView: NSView, NSTextFieldDelegate {
     private struct Cell {
         var file: ZoneStoredFile
@@ -449,12 +482,16 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
     private var thumbnailGeneration = 0
     private var renameEditor: NSTextField?
     private var renamingFileURL: URL?
+    private var renamingFileSnapshot: ZoneStoredFile?
     private weak var renameCommandEditor: NSTextField?
     private var quickLookDataSource: ZoneQuickLookDataSource?
     private(set) var selectedFileURL: URL?
     var zoneID = UUID()
     var fileSortOrder: ZoneFileSortOrder = .name
     var fileContextMenuController = ZoneFileContextMenuController()
+    var quickLookPanelProvider: () -> ZoneQuickLookPanelAdapting = {
+        QLPreviewPanel.shared()!
+    }
 
     var thumbnailProvider: ZoneFileThumbnailProviding = ZoneFileThumbnailProvider() {
         didSet {
@@ -473,7 +510,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
     }
 
     var onOpenFile: ((URL) -> Void)?
-    var onRenameFile: ((URL, String) -> Result<URL, Error>)?
+    var onRenameFile: ((ZoneStoredFile, String) -> Result<URL, Error>)?
     var onPresentError: ((String) -> Void)?
     var onRefreshFiles: ((UUID) -> Void)?
 
@@ -681,6 +718,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         cancelRenaming()
         selectedFileURL = url
         renamingFileURL = url
+        renamingFileSnapshot = cell.file
 
         let editor = NSTextField(frame: cell.titleBackgroundFrame)
         editor.stringValue = cell.file.displayName
@@ -730,15 +768,21 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
 
         window.makeFirstResponder(self)
         window.makeKey()
-        let panel = QLPreviewPanel.shared()!
+        let panel = quickLookPanelProvider()
+        _ = presentPreparedQuickLook(using: panel)
+    }
+
+    @discardableResult
+    func presentPreparedQuickLook(using panel: ZoneQuickLookPanelAdapting) -> Bool {
         panel.updateController()
-        guard (panel.currentController as AnyObject?) === self else {
+        guard panel.hasCurrentController(self) else {
             quickLookDataSource = nil
             onPresentError?("无法获取快速查看控制权。")
-            return
+            return false
         }
         configureQuickLookPanel(panel)
-        panel.makeKeyAndOrderFront(nil)
+        panel.show()
+        return true
     }
 
     override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
@@ -749,18 +793,23 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         configureQuickLookPanel(panel)
     }
 
-    private func configureQuickLookPanel(_ panel: QLPreviewPanel) {
+    private func configureQuickLookPanel(_ panel: ZoneQuickLookPanelAdapting) {
         guard let quickLookDataSource else {
             return
         }
-        panel.dataSource = quickLookDataSource
-        panel.currentPreviewItemIndex = 0
+        panel.setDataSource(quickLookDataSource)
+        panel.setCurrentPreviewItemIndex(0)
         panel.reloadData()
     }
 
     override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
-        if panel.dataSource === quickLookDataSource {
-            panel.dataSource = nil
+        endQuickLookControl(using: panel)
+    }
+
+    func endQuickLookControl(using panel: ZoneQuickLookPanelAdapting) {
+        if let quickLookDataSource,
+           panel.hasDataSource(quickLookDataSource) {
+            panel.setDataSource(nil)
         }
         quickLookDataSource = nil
     }
@@ -770,6 +819,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         let editor = renameEditor
         renameEditor = nil
         renamingFileURL = nil
+        renamingFileSnapshot = nil
         editor?.removeFromSuperview()
         if let editedURL,
            let cell = cells.first(where: { $0.file.url == editedURL }) {
@@ -779,7 +829,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
 
     func commitRenaming() {
         guard let editor = renameEditor,
-              let renamingFileURL else {
+              let renamingFileSnapshot else {
             cancelRenaming()
             return
         }
@@ -797,7 +847,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
             return
         }
 
-        switch onRenameFile(renamingFileURL, editor.stringValue) {
+        switch onRenameFile(renamingFileSnapshot, editor.stringValue) {
         case let .success(renamedURL):
             cancelRenaming()
             selectedFileURL = renamedURL
@@ -1153,7 +1203,7 @@ final class ZoneView: NSView {
         get { filesView.onOpenFile }
         set { filesView.onOpenFile = newValue }
     }
-    var onRenameFile: ((URL, String) -> Result<URL, Error>)? {
+    var onRenameFile: ((ZoneStoredFile, String) -> Result<URL, Error>)? {
         get { filesView.onRenameFile }
         set { filesView.onRenameFile = newValue }
     }
@@ -1619,10 +1669,11 @@ final class ZoneFileOperationCoordinator {
     }
 
     func renameItem(
-        _ url: URL,
+        _ sourceFile: ZoneStoredFile,
         to newName: String,
         in zoneID: UUID
     ) -> Result<URL, Error> {
+        let url = sourceFile.url
         let zone: ZoneModel
         switch validatedItem(zoneID: zoneID, url: url) {
         case let .success(validatedZone):
@@ -1645,11 +1696,10 @@ final class ZoneFileOperationCoordinator {
                     files[index].url = renamedURL
                     files[index].displayName = renamedURL.lastPathComponent
                 } else {
-                    files.append(ZoneStoredFile(
-                        url: renamedURL,
-                        displayName: renamedURL.lastPathComponent,
-                        category: DesktopFileClassifier.classify(url: renamedURL)
-                    ))
+                    var renamedFile = sourceFile
+                    renamedFile.url = renamedURL
+                    renamedFile.displayName = renamedURL.lastPathComponent
+                    files.append(renamedFile)
                 }
                 installCached(files, for: zone)
                 presentRefreshFallback(error)
@@ -1768,7 +1818,7 @@ final class WindowManager {
     var onOpenFile: ((URL) -> Void)?
     var onCreateFolder: ((UUID) -> Void)?
     var onChangeSortOrder: ((UUID, ZoneFileSortOrder) -> Void)?
-    var onRenameFile: ((UUID, URL, String) -> Result<URL, Error>)?
+    var onRenameFile: ((UUID, ZoneStoredFile, String) -> Result<URL, Error>)?
     var onTrashFile: ((UUID, URL) -> Void)?
     var onRefreshFiles: ((UUID) -> Void)?
     var onPresentFileError: ((String, String) -> Void)?
@@ -1828,7 +1878,7 @@ final class WindowManager {
             window.onOpenFile = { [weak self] url in
                 self?.onOpenFile?(url)
             }
-            window.onRenameFile = { [weak self] url, name in
+            window.onRenameFile = { [weak self] file, name in
                 guard let self, let onRenameFile = self.onRenameFile else {
                     return .failure(NSError(
                         domain: "ZoneDesk.ZoneFileRename",
@@ -1836,7 +1886,7 @@ final class WindowManager {
                         userInfo: [NSLocalizedDescriptionKey: "重命名服务暂不可用。"]
                     ))
                 }
-                return onRenameFile(zone.id, url, name)
+                return onRenameFile(zone.id, file, name)
             }
             window.onPresentFileError = { [weak self] details in
                 self?.onPresentFileError?("无法重新命名", details)
@@ -2153,8 +2203,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowManager.onChangeSortOrder = { [weak self] zoneID, order in
             self?.changeFileSortOrder(order, in: zoneID)
         }
-        windowManager.onRenameFile = { [weak self] zoneID, url, name in
-            self?.renameStoredFile(url, to: name, in: zoneID)
+        windowManager.onRenameFile = { [weak self] zoneID, file, name in
+            self?.renameStoredFile(file, to: name, in: zoneID)
                 ?? .failure(NSError(
                     domain: "ZoneDesk.ZoneFileRename",
                     code: 2,
@@ -2263,11 +2313,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func renameStoredFile(
-        _ url: URL,
+        _ file: ZoneStoredFile,
         to newName: String,
         in zoneID: UUID
     ) -> Result<URL, Error> {
-        fileOperationCoordinator.renameItem(url, to: newName, in: zoneID)
+        fileOperationCoordinator.renameItem(file, to: newName, in: zoneID)
     }
 
     private func trashStoredFile(_ url: URL, in zoneID: UUID) {

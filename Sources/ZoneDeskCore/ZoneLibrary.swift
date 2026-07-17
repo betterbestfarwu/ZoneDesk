@@ -37,6 +37,50 @@ public struct ZoneStoredFile: Equatable, Sendable {
     }
 }
 
+struct ZoneFileResourceValues {
+    var isHidden: Bool?
+    var isDirectory: Bool?
+    var fileSize: Int?
+    var lastOpenedDate: Date?
+    var dateAdded: Date?
+    var modificationDate: Date?
+    var creationDate: Date?
+    var tagNames: [String]?
+
+    init(
+        isHidden: Bool? = nil,
+        isDirectory: Bool? = nil,
+        fileSize: Int? = nil,
+        lastOpenedDate: Date? = nil,
+        dateAdded: Date? = nil,
+        modificationDate: Date? = nil,
+        creationDate: Date? = nil,
+        tagNames: [String]? = nil
+    ) {
+        self.isHidden = isHidden
+        self.isDirectory = isDirectory
+        self.fileSize = fileSize
+        self.lastOpenedDate = lastOpenedDate
+        self.dateAdded = dateAdded
+        self.modificationDate = modificationDate
+        self.creationDate = creationDate
+        self.tagNames = tagNames
+    }
+
+    init(_ values: URLResourceValues) {
+        self.init(
+            isHidden: values.isHidden,
+            isDirectory: values.isDirectory,
+            fileSize: values.fileSize,
+            lastOpenedDate: values.contentAccessDate,
+            dateAdded: values.addedToDirectoryDate,
+            modificationDate: values.contentModificationDate,
+            creationDate: values.creationDate,
+            tagNames: values.tagNames
+        )
+    }
+}
+
 public struct ZoneCollectionMove: Equatable, Sendable {
     public var source: URL
     public var destination: URL
@@ -103,7 +147,7 @@ public struct ZoneRestoreReport: Equatable, Sendable {
     }
 }
 
-public enum ZoneLibraryError: Error, Equatable, CustomStringConvertible {
+public enum ZoneLibraryError: Error, Equatable, CustomStringConvertible, LocalizedError {
     case destinationDirectoryExists(URL)
     case invalidItemName(String)
     case destinationItemExists(URL)
@@ -121,15 +165,53 @@ public enum ZoneLibraryError: Error, Equatable, CustomStringConvertible {
             return "Source item is outside the zone directory: \(url.path)"
         }
     }
+
+    public var errorDescription: String? {
+        description
+    }
 }
 
 public struct ZoneLibrary {
     public var rootURL: URL
     public var fileManager: FileManager
+    private var resourceValuesReader: (URL, Set<URLResourceKey>) throws -> ZoneFileResourceValues
+    private var volumeSupportsCaseSensitiveNames: (URL) -> Bool?
+    private var renameMoveItem: (URL, URL) throws -> Void
 
     public init(rootURL: URL? = nil, fileManager: FileManager = .default) {
         self.rootURL = rootURL ?? Self.defaultRootURL()
         self.fileManager = fileManager
+        resourceValuesReader = { url, keys in
+            ZoneFileResourceValues(try url.resourceValues(forKeys: keys))
+        }
+        volumeSupportsCaseSensitiveNames = { url in
+            (try? url.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?
+                .volumeSupportsCaseSensitiveNames
+        }
+        renameMoveItem = { from, to in
+            try fileManager.moveItem(at: from, to: to)
+        }
+    }
+
+    init(
+        rootURL: URL,
+        fileManager: FileManager = .default,
+        resourceValuesReader: @escaping (URL, Set<URLResourceKey>) throws -> ZoneFileResourceValues = { url, keys in
+            ZoneFileResourceValues(try url.resourceValues(forKeys: keys))
+        },
+        volumeSupportsCaseSensitiveNames: @escaping (URL) -> Bool? = { url in
+            (try? url.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?
+                .volumeSupportsCaseSensitiveNames
+        },
+        renameMoveItem: ((URL, URL) throws -> Void)? = nil
+    ) {
+        self.rootURL = rootURL
+        self.fileManager = fileManager
+        self.resourceValuesReader = resourceValuesReader
+        self.volumeSupportsCaseSensitiveNames = volumeSupportsCaseSensitiveNames
+        self.renameMoveItem = renameMoveItem ?? { from, to in
+            try fileManager.moveItem(at: from, to: to)
+        }
     }
 
     public static func defaultRootURL() -> URL {
@@ -201,11 +283,22 @@ public struct ZoneLibrary {
             options: [.skipsPackageDescendants]
         )
 
-        return try urls.compactMap { url in
+        return urls.compactMap { url in
             guard !url.lastPathComponent.hasPrefix(".") else {
                 return nil
             }
-            let resourceValues = try url.resourceValues(forKeys: resourceKeys)
+            let resourceValues: ZoneFileResourceValues
+            do {
+                resourceValues = try resourceValuesReader(url, resourceKeys)
+            } catch {
+                guard fileManager.fileExists(atPath: url.path) else {
+                    return nil
+                }
+                resourceValues = ZoneFileResourceValues()
+            }
+            guard resourceValues.isHidden != true else {
+                return nil
+            }
 
             return ZoneStoredFile(
                 url: url,
@@ -213,9 +306,9 @@ public struct ZoneLibrary {
                 category: DesktopFileClassifier.classify(url: url),
                 isDirectory: resourceValues.isDirectory ?? false,
                 fileSize: resourceValues.fileSize,
-                lastOpenedDate: resourceValues.contentAccessDate,
-                dateAdded: resourceValues.addedToDirectoryDate,
-                modificationDate: resourceValues.contentModificationDate,
+                lastOpenedDate: resourceValues.lastOpenedDate,
+                dateAdded: resourceValues.dateAdded,
+                modificationDate: resourceValues.modificationDate,
                 creationDate: resourceValues.creationDate,
                 tagNames: resourceValues.tagNames ?? []
             )
@@ -253,11 +346,28 @@ public struct ZoneLibrary {
         }
 
         let destination = directory.appendingPathComponent(newName)
+        guard standardizedSource != destination.standardizedFileURL else {
+            return standardizedSource
+        }
+
+        let isCaseOnlyRename = standardizedSource.lastPathComponent.compare(
+            newName,
+            options: [.caseInsensitive, .literal]
+        ) == .orderedSame
+        if isCaseOnlyRename,
+           volumeSupportsCaseSensitiveNames(directory) != true {
+            return try renameCaseOnlyStoredItem(
+                from: standardizedSource,
+                to: destination,
+                in: directory
+            )
+        }
+
         guard !fileManager.fileExists(atPath: destination.path) else {
             throw ZoneLibraryError.destinationItemExists(destination)
         }
 
-        try fileManager.moveItem(at: standardizedSource, to: destination)
+        try renameMoveItem(standardizedSource, destination)
         return destination
     }
 
@@ -401,6 +511,41 @@ public struct ZoneLibrary {
         else {
             throw ZoneLibraryError.invalidItemName(name)
         }
+    }
+
+    private func renameCaseOnlyStoredItem(
+        from source: URL,
+        to destination: URL,
+        in directory: URL
+    ) throws -> URL {
+        var temporaryURL: URL
+        repeat {
+            temporaryURL = directory.appendingPathComponent(
+                ".ZoneDesk Rename \(UUID().uuidString)"
+            )
+        } while fileManager.fileExists(atPath: temporaryURL.path)
+
+        try renameMoveItem(source, temporaryURL)
+        guard !fileManager.fileExists(atPath: destination.path) else {
+            try? restoreRenameItem(from: temporaryURL, to: source)
+            throw ZoneLibraryError.destinationItemExists(destination)
+        }
+
+        do {
+            try renameMoveItem(temporaryURL, destination)
+            return destination
+        } catch {
+            try? restoreRenameItem(from: temporaryURL, to: source)
+            throw error
+        }
+    }
+
+    private func restoreRenameItem(from temporaryURL: URL, to source: URL) throws {
+        guard fileManager.fileExists(atPath: temporaryURL.path),
+              !fileManager.fileExists(atPath: source.path) else {
+            return
+        }
+        try renameMoveItem(temporaryURL, source)
     }
 
     private func uniqueDestinationURL(in directory: URL, preferredName: String) -> URL {

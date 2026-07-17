@@ -104,40 +104,42 @@ struct ZoneFilesViewSelectionTests {
         #expect(expression == "\"a\\\\\\\"b\" & return & \"\" & linefeed & \"c\"")
     }
 
-    @Test("Quick Look responder owns and releases the preview data source")
-    func quickLookControlLifecycle() {
+    @Test("Quick Look adapter configures and cleans up the preview session in order")
+    func quickLookAdapterLifecycle() {
         let view = ZoneFilesView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
-        let panel = QLPreviewPanel.shared()!
+        let panel = QuickLookPanelSpy(currentController: view)
         view.prepareQuickLook(url: URL(fileURLWithPath: "/tmp/preview.pdf"))
 
-        #expect(view.acceptsPreviewPanelControl(panel))
-        view.beginPreviewPanelControl(panel)
-        #expect(panel.dataSource === view.quickLookDataSourceForTesting)
+        #expect(view.presentPreparedQuickLook(using: panel))
+        #expect(panel.events == [
+            "updateController",
+            "currentController",
+            "setDataSource",
+            "setCurrentPreviewItemIndex:0",
+            "reloadData",
+            "show",
+        ])
+        #expect((panel.dataSource as AnyObject?) === view.quickLookDataSourceForTesting)
 
-        view.endPreviewPanelControl(panel)
+        view.endQuickLookControl(using: panel)
+        #expect(panel.events.last == "clearDataSource")
         #expect(panel.dataSource == nil)
         #expect(view.quickLookDataSourceForTesting == nil)
     }
 
-    @Test("Quick Look presentation leaves lifecycle callbacks to the framework")
-    func quickLookPresentationDoesNotInvokeLifecycleCallback() throws {
-        let packageRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let source = try String(contentsOf: packageRoot.appendingPathComponent(
-            "Sources/ZoneDeskApp/main.swift"
-        ))
-        let methodStart = try #require(source.range(
-            of: "    func presentQuickLook(url: URL) {"
-        ))
-        let methodEnd = try #require(source.range(
-            of: "\n    override func acceptsPreviewPanelControl",
-            range: methodStart.upperBound..<source.endIndex
-        ))
-        let methodBody = source[methodStart.lowerBound..<methodEnd.lowerBound]
+    @Test("Quick Look rejects a panel controlled by another responder")
+    func quickLookRejectsDifferentController() {
+        let view = ZoneFilesView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+        let panel = QuickLookPanelSpy(currentController: NSResponder())
+        var message: String?
+        view.onPresentError = { message = $0 }
+        view.prepareQuickLook(url: URL(fileURLWithPath: "/tmp/preview.pdf"))
 
-        #expect(!methodBody.contains("beginPreviewPanelControl"))
+        #expect(!view.presentPreparedQuickLook(using: panel))
+        #expect(panel.events == ["updateController", "currentController"])
+        #expect(panel.dataSource == nil)
+        #expect(view.quickLookDataSourceForTesting == nil)
+        #expect(message == "无法获取快速查看控制权。")
     }
 
     @Test("WindowManager routes menu actions with the captured zone identifier")
@@ -174,7 +176,7 @@ struct ZoneFilesViewSelectionTests {
     func renameRefreshFailureUsesCacheFallback() {
         let harness = ZoneFileOperationHarness()
         harness.scanError = OperationHarnessError.expected
-        let source = harness.filesByZoneID[harness.zone.id]![0].url
+        let source = harness.filesByZoneID[harness.zone.id]![0]
 
         let result = harness.coordinator.renameItem(source, to: "renamed", in: harness.zone.id)
 
@@ -182,9 +184,42 @@ struct ZoneFilesViewSelectionTests {
             Issue.record("rename should succeed after a cache fallback")
             return
         }
-        #expect(harness.filesByZoneID[harness.zone.id]?.contains(where: { $0.url == source }) == false)
+        #expect(harness.filesByZoneID[harness.zone.id]?.contains(where: { $0.url == source.url }) == false)
         #expect(harness.filesByZoneID[harness.zone.id]?.contains(where: { $0.url == renamedURL }) == true)
         #expect(harness.presentedErrors.count == 1)
+    }
+
+    @Test("rename scan fallback preserves a source snapshot missing from the cache")
+    func renameFallbackPreservesSourceSnapshot() throws {
+        let harness = ZoneFileOperationHarness()
+        harness.scanError = OperationHarnessError.expected
+        let sourceURL = harness.directoryURL.appendingPathComponent("Snapshot Folder", isDirectory: true)
+        let source = ZoneStoredFile(
+            url: sourceURL,
+            displayName: "Snapshot Folder",
+            category: .other,
+            isDirectory: true,
+            fileSize: 42,
+            lastOpenedDate: Date(timeIntervalSince1970: 1),
+            dateAdded: Date(timeIntervalSince1970: 2),
+            modificationDate: Date(timeIntervalSince1970: 3),
+            creationDate: Date(timeIntervalSince1970: 4),
+            tagNames: ["Pinned"]
+        )
+        harness.filesByZoneID[harness.zone.id] = []
+        harness.existingPaths.insert(sourceURL.standardizedFileURL)
+
+        let result = harness.coordinator.renameItem(
+            source,
+            to: "Renamed Folder",
+            in: harness.zone.id
+        )
+
+        let renamedURL = try result.get()
+        var expected = source
+        expected.url = renamedURL
+        expected.displayName = "Renamed Folder"
+        #expect(harness.filesByZoneID[harness.zone.id] == [expected])
     }
 
     @Test("Open With and Share keep dynamic targets alive and dispatch injected services")
@@ -631,9 +666,9 @@ struct ZoneFilesViewSelectionTests {
     func renameCommandRouting() throws {
         let fixture = try ZoneFilesViewFixture(fileCount: 1)
         var commitCount = 0
-        fixture.view.onRenameFile = { url, _ in
+        fixture.view.onRenameFile = { file, _ in
             commitCount += 1
-            return .success(url)
+            return .success(file.url)
         }
         fixture.view.beginRenaming(url: fixture.files[0].url)
         let field = try #require(fixture.renameField)
@@ -661,9 +696,9 @@ struct ZoneFilesViewSelectionTests {
     func renameCommitsWhenFocusIsLost() throws {
         let fixture = try ZoneFilesViewFixture(fileCount: 1)
         var submittedNames: [String] = []
-        fixture.view.onRenameFile = { url, name in
+        fixture.view.onRenameFile = { file, name in
             submittedNames.append(name)
-            return .success(url.deletingLastPathComponent().appendingPathComponent(name))
+            return .success(file.url.deletingLastPathComponent().appendingPathComponent(name))
         }
         fixture.view.beginRenaming(url: fixture.files[0].url)
         fixture.view.renameEditorStringValue = "focused.pdf"
@@ -697,9 +732,9 @@ struct ZoneFilesViewSelectionTests {
         let fixture = try ZoneFilesViewFixture(fileCount: 1)
         var callbackCount = 0
         var presentedMessage: String?
-        fixture.view.onRenameFile = { url, _ in
+        fixture.view.onRenameFile = { file, _ in
             callbackCount += 1
-            return .success(url)
+            return .success(file.url)
         }
         fixture.view.onPresentError = { presentedMessage = $0 }
         fixture.view.beginRenaming(url: fixture.files[0].url)
@@ -719,9 +754,9 @@ struct ZoneFilesViewSelectionTests {
     func renameCommandsDoNotResolveTwice() throws {
         let fixture = try ZoneFilesViewFixture(fileCount: 1)
         var commitCount = 0
-        fixture.view.onRenameFile = { url, _ in
+        fixture.view.onRenameFile = { file, _ in
             commitCount += 1
-            return .success(url)
+            return .success(file.url)
         }
         fixture.view.beginRenaming(url: fixture.files[0].url)
         let returnField = try #require(fixture.renameField)
@@ -935,6 +970,47 @@ struct ZoneFilesViewSelectionTests {
 
 private enum OperationHarnessError: Error {
     case expected
+}
+
+@MainActor
+private final class QuickLookPanelSpy: ZoneQuickLookPanelAdapting {
+    private let controller: AnyObject
+    private(set) var events: [String] = []
+    private(set) var dataSource: QLPreviewPanelDataSource?
+
+    init(currentController: AnyObject) {
+        controller = currentController
+    }
+
+    func updateController() {
+        events.append("updateController")
+    }
+
+    func hasCurrentController(_ candidate: AnyObject) -> Bool {
+        events.append("currentController")
+        return controller === candidate
+    }
+
+    func setDataSource(_ dataSource: QLPreviewPanelDataSource?) {
+        events.append(dataSource == nil ? "clearDataSource" : "setDataSource")
+        self.dataSource = dataSource
+    }
+
+    func hasDataSource(_ dataSource: QLPreviewPanelDataSource) -> Bool {
+        (self.dataSource as AnyObject?) === dataSource
+    }
+
+    func setCurrentPreviewItemIndex(_ index: Int) {
+        events.append("setCurrentPreviewItemIndex:\(index)")
+    }
+
+    func reloadData() {
+        events.append("reloadData")
+    }
+
+    func show() {
+        events.append("show")
+    }
 }
 
 @MainActor

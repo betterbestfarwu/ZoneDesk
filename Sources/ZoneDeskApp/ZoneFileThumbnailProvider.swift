@@ -247,9 +247,18 @@ final class ZoneFileThumbnailProvider: ZoneFileThumbnailProviding {
     nonisolated private static func decodeVideo(at url: URL, size: NSSize) -> CGImage? {
         let asset = AVAsset(url: url)
         let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = size
+        configureVideoGenerator(generator, maximumSize: size)
         return try? generator.copyCGImage(at: .zero, actualTime: nil)
+    }
+
+    nonisolated static func configureVideoGenerator(
+        _ generator: AVAssetImageGenerator,
+        maximumSize: NSSize
+    ) {
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = maximumSize
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
     }
 
     private static let supportedCategories: Set<FileCategory> = [
