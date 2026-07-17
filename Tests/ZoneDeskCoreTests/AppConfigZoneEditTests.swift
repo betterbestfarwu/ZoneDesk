@@ -144,6 +144,40 @@ struct AppConfigZoneEditTests {
         #expect(!loadedConfig.zones.contains(where: { $0.id == deletedZone.id }))
         #expect(loadedConfig.zones == config.zones)
     }
+
+    @Test("legacy zones default to name sorting")
+    func legacyZonesDefaultToNameSorting() throws {
+        let zone = ZoneModel(
+            name: "图片",
+            rect: ZoneRect(x: 0, y: 0, width: 300, height: 220),
+            acceptedCategories: [.image],
+            locked: false
+        )
+        var object = try #require(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(zone)) as? [String: Any]
+        )
+        object.removeValue(forKey: "fileSortOrder")
+
+        let data = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(ZoneModel.self, from: data)
+
+        #expect(decoded.fileSortOrder == .name)
+    }
+
+    @Test("config preserves independent zone sort orders")
+    func configPreservesIndependentZoneSortOrders() throws {
+        let fixture = try TemporaryConfigFixture()
+        defer { fixture.cleanUp() }
+        var config = AppConfig.defaultConfig()
+        config.zones[0].fileSortOrder = .dateModified
+        config.zones[1].fileSortOrder = .size
+
+        try ConfigManager(url: fixture.configURL).save(config)
+        let loaded = ConfigManager(url: fixture.configURL).load(defaultConfig: .defaultConfig())
+
+        #expect(loaded.zones[0].fileSortOrder == .dateModified)
+        #expect(loaded.zones[1].fileSortOrder == .size)
+    }
 }
 
 private struct TemporaryConfigFixture {

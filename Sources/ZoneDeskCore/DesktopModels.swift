@@ -42,19 +42,49 @@ public struct ZoneModel: Codable, Equatable, Identifiable, Sendable {
     public var rect: ZoneRect
     public var acceptedCategories: [FileCategory]
     public var locked: Bool
+    public var fileSortOrder: ZoneFileSortOrder
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, rect, acceptedCategories, locked, fileSortOrder
+    }
 
     public init(
         id: UUID = UUID(),
         name: String,
         rect: ZoneRect,
         acceptedCategories: [FileCategory],
-        locked: Bool
+        locked: Bool,
+        fileSortOrder: ZoneFileSortOrder = .name
     ) {
         self.id = id
         self.name = name
         self.rect = rect
         self.acceptedCategories = acceptedCategories
         self.locked = locked
+        self.fileSortOrder = fileSortOrder
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        rect = try container.decode(ZoneRect.self, forKey: .rect)
+        acceptedCategories = try container.decode([FileCategory].self, forKey: .acceptedCategories)
+        locked = try container.decode(Bool.self, forKey: .locked)
+        fileSortOrder = try container.decodeIfPresent(
+            ZoneFileSortOrder.self,
+            forKey: .fileSortOrder
+        ) ?? .name
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(rect, forKey: .rect)
+        try container.encode(acceptedCategories, forKey: .acceptedCategories)
+        try container.encode(locked, forKey: .locked)
+        try container.encode(fileSortOrder, forKey: .fileSortOrder)
     }
 }
 
