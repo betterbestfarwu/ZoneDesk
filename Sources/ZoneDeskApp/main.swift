@@ -446,11 +446,13 @@ final class ZoneFilesView: NSView {
         guard let cell = cells.first(where: { $0.frame.contains(point) }) else {
             selectedFileURL = nil
             needsDisplay = true
+            displayIfNeeded()
             return
         }
 
         selectedFileURL = cell.file.url
         needsDisplay = true
+        displayIfNeeded()
         if event.clickCount >= 2 {
             onOpenFile?(cell.file.url)
         }

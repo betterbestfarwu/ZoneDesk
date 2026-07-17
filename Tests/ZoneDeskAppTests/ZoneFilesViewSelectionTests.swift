@@ -22,6 +22,73 @@ struct ZoneFilesViewSelectionTests {
         #expect(fixture.view.selectedFileURL == nil)
     }
 
+    @Test("selection remains visibly rendered after the pointer exits")
+    func selectionRemainsVisiblyRenderedAfterMouseExit() throws {
+        let fixture = try ZoneFilesViewFixture(fileCount: 1)
+        let beforeSelection = try fixture.renderedBitmap()
+
+        fixture.clickFile(at: 0)
+        fixture.view.mouseExited(with: fixture.event(at: .zero, clickCount: 1))
+        let afterMouseExit = try fixture.renderedBitmap()
+
+        #expect(changedPixelCount(from: beforeSelection, to: afterMouseExit) > 100)
+    }
+
+    @Test("zone window click leaves a visible selection after pointer exit")
+    func zoneWindowClickLeavesVisibleSelection() throws {
+        let zone = ZoneModel(
+            name: "文档",
+            rect: ZoneRect(x: 0, y: 0, width: 320, height: 240),
+            acceptedCategories: [.document],
+            locked: false
+        )
+        let file = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/selected-file.pdf"),
+            displayName: "selected-file.pdf",
+            category: .document
+        )
+        let window = ZoneWindow(zone: zone)
+        defer { window.orderOut(nil) }
+        window.update(
+            zone: zone,
+            isEditing: false,
+            isSelected: false,
+            files: [file]
+        )
+        window.layoutIfNeeded()
+        window.orderFrontRegardless()
+
+        let zoneView = try #require(window.contentView as? ZoneView)
+        let scrollView = try #require(
+            zoneView.subviews.compactMap { $0 as? NSScrollView }.first
+        )
+        let filesView = try #require(scrollView.documentView as? ZoneFilesView)
+        let fileFrame = try #require(filesView.fileFrame(at: 0))
+        let beforeSelection = try captureBitmap(of: filesView)
+        let clickEvent = try #require(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: filesView.convert(
+                NSPoint(x: fileFrame.midX, y: fileFrame.midY),
+                to: nil
+            ),
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1
+        ))
+
+        window.sendEvent(clickEvent)
+        #expect(!filesView.needsDisplay)
+        zoneView.mouseExited(with: clickEvent)
+        let afterMouseExit = try captureBitmap(of: filesView)
+
+        #expect(filesView.selectedFileURL == file.url)
+        #expect(changedPixelCount(from: beforeSelection, to: afterMouseExit) > 100)
+    }
+
     @Test("double click keeps selection and opens the file")
     func doubleClickOpensFile() throws {
         let fixture = try ZoneFilesViewFixture(fileCount: 1)
@@ -89,6 +156,38 @@ struct ZoneFilesViewSelectionTests {
     }
 }
 
+private func changedPixelCount(
+    from first: NSBitmapImageRep,
+    to second: NSBitmapImageRep
+) -> Int {
+    var count = 0
+    for y in 0..<min(first.pixelsHigh, second.pixelsHigh) {
+        for x in 0..<min(first.pixelsWide, second.pixelsWide) {
+            guard let firstColor = first.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
+                  let secondColor = second.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB)
+            else {
+                continue
+            }
+            let difference = abs(firstColor.redComponent - secondColor.redComponent)
+                + abs(firstColor.greenComponent - secondColor.greenComponent)
+                + abs(firstColor.blueComponent - secondColor.blueComponent)
+                + abs(firstColor.alphaComponent - secondColor.alphaComponent)
+            if difference > 0.08 {
+                count += 1
+            }
+        }
+    }
+    return count
+}
+
+@MainActor
+private func captureBitmap(of view: NSView) throws -> NSBitmapImageRep {
+    view.displayIfNeeded()
+    let bitmap = try #require(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+    view.cacheDisplay(in: view.bounds, to: bitmap)
+    return bitmap
+}
+
 @MainActor
 private final class ZoneFilesViewFixture {
     let view = ZoneFilesView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
@@ -137,5 +236,9 @@ private final class ZoneFilesViewFixture {
             clickCount: clickCount,
             pressure: 1
         )!
+    }
+
+    func renderedBitmap() throws -> NSBitmapImageRep {
+        try captureBitmap(of: view)
     }
 }
