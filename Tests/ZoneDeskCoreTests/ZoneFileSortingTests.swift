@@ -40,4 +40,55 @@ struct ZoneFileSortingTests {
         ]
         #expect(ZoneStoredFileSorter.sorted(files, by: .size).map(\.displayName) == ["a", "c", "b"])
     }
+
+    @Test("present optional metadata sorts before missing metadata for every order")
+    func presentMetadataBeforeMissingMetadata() {
+        let date = Date(timeIntervalSince1970: 100)
+        let present = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/present"),
+            displayName: "z-present",
+            category: .other,
+            fileSize: 1,
+            lastOpenedDate: date,
+            dateAdded: date,
+            modificationDate: date,
+            creationDate: date
+        )
+        let missing = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/missing"),
+            displayName: "a-missing",
+            category: .other
+        )
+
+        for order in [
+            ZoneFileSortOrder.lastOpened,
+            .dateAdded,
+            .dateModified,
+            .dateCreated,
+            .size,
+        ] {
+            #expect(
+                ZoneStoredFileSorter.sorted([missing, present], by: order).map(\.url)
+                    == [present.url, missing.url]
+            )
+        }
+    }
+
+    @Test("preserves input order when metadata and names compare equally")
+    func preservesInputOrderForExactTies() {
+        let first = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/first"),
+            displayName: "same",
+            category: .other,
+            fileSize: 1
+        )
+        let second = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/second"),
+            displayName: "same",
+            category: .other,
+            fileSize: 1
+        )
+
+        #expect(ZoneStoredFileSorter.sorted([second, first], by: .size).map(\.url) == [second.url, first.url])
+    }
 }

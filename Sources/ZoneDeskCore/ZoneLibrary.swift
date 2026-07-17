@@ -225,6 +225,7 @@ public struct ZoneLibrary {
 
     public func createFolder(in zone: ZoneModel, preferredName: String) throws -> URL {
         let directory = try ensureDirectory(for: zone)
+        try validateItemName(preferredName)
         var index = 1
 
         while true {
@@ -243,14 +244,7 @@ public struct ZoneLibrary {
         to newName: String,
         in zone: ZoneModel
     ) throws -> URL {
-        let trimmedName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedName.isEmpty,
-              !newName.contains("/"),
-              newName != ".",
-              newName != ".."
-        else {
-            throw ZoneLibraryError.invalidItemName(newName)
-        }
+        try validateItemName(newName)
 
         let directory = directoryURL(for: zone).standardizedFileURL
         let standardizedSource = source.standardizedFileURL
@@ -396,6 +390,17 @@ public struct ZoneLibrary {
         return name
             .components(separatedBy: invalidCharacters)
             .joined(separator: "-")
+    }
+
+    private func validateItemName(_ name: String) throws {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty,
+              !name.contains("/"),
+              name != ".",
+              name != ".."
+        else {
+            throw ZoneLibraryError.invalidItemName(name)
+        }
     }
 
     private func uniqueDestinationURL(in directory: URL, preferredName: String) -> URL {

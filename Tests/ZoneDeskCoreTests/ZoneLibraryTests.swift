@@ -25,6 +25,24 @@ struct ZoneLibraryTests {
         }
     }
 
+    @Test("rejects invalid folder names without escaping the zone")
+    func rejectsInvalidFolderNames() throws {
+        let fixture = try TemporaryZoneLibraryFixture()
+        defer { fixture.cleanUp() }
+        let zone = fixture.zone(name: "资料", categories: [.other])
+        let outside = fixture.library.directoryURL(for: zone)
+            .deletingLastPathComponent()
+            .appendingPathComponent("outside", isDirectory: true)
+
+        for invalidName in ["", "   ", ".", "..", "nested/name", "../outside"] {
+            #expect(throws: ZoneLibraryError.invalidItemName(invalidName)) {
+                try fixture.library.createFolder(in: zone, preferredName: invalidName)
+            }
+        }
+
+        #expect(!FileManager.default.fileExists(atPath: outside.path))
+    }
+
     @Test("loads stored file metadata")
     func loadsStoredFileMetadata() throws {
         let fixture = try TemporaryZoneLibraryFixture()
