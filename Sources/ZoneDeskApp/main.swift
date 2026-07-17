@@ -356,12 +356,8 @@ final class ZoneFilesView: NSView {
 
     private var files: [ZoneStoredFile] = []
     private var cells: [Cell] = []
-    private var trackingArea: NSTrackingArea?
-    private var hoveredCellIndex: Int?
-    private let iconSize: CGFloat = 48
-    private let cellWidth: CGFloat = 88
-    private let cellHeight: CGFloat = 78
-    private let padding: CGFloat = 12
+    private var fileLayout = FinderDesktopIconLayout.finderDefault
+    private(set) var selectedFileURL: URL?
 
     var onOpenFile: ((URL) -> Void)?
 
@@ -369,30 +365,24 @@ final class ZoneFilesView: NSView {
         true
     }
 
-    func setFiles(_ files: [ZoneStoredFile]) {
+    func setFiles(
+        _ files: [ZoneStoredFile],
+        layout: FinderDesktopIconLayout = .finderDefault
+    ) {
         self.files = files
-        frame.size.height = requiredHeight(forWidth: max(bounds.width, cellWidth + padding * 2))
+        fileLayout = layout
+        if let selectedFileURL, !files.contains(where: { $0.url == selectedFileURL }) {
+            self.selectedFileURL = nil
+        }
+        frame.size.height = requiredHeight(
+            forWidth: max(bounds.width, CGFloat(layout.cellSize + layout.edgeInset * 2))
+        )
         needsLayout = true
         needsDisplay = true
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingArea {
-            removeTrackingArea(trackingArea)
-        }
-
-        let area = NSTrackingArea(
-            rect: bounds,
-            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved],
-            owner: self
-        )
-        addTrackingArea(area)
-        trackingArea = area
     }
 
     override func layout() {
@@ -404,47 +394,38 @@ final class ZoneFilesView: NSView {
         super.draw(dirtyRect)
 
         for (index, cell) in cells.enumerated() {
-            if hoveredCellIndex == index {
-                drawHoverState(in: cell.frame)
+            let isSelected = cell.file.url == selectedFileURL
+            if isSelected, let regions = selectionRects(at: index) {
+                drawIconSelection(in: regions.icon)
             }
 
             let icon = NSWorkspace.shared.icon(forFile: cell.file.url.path)
-            icon.size = NSSize(width: iconSize, height: iconSize)
+            icon.size = cell.iconFrame.size
             icon.draw(in: cell.iconFrame)
 
-            let paragraph = NSMutableParagraphStyle()
-            paragraph.alignment = .center
-            paragraph.lineBreakMode = .byTruncatingMiddle
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 10),
-                .foregroundColor: NSColor.white.withAlphaComponent(0.92),
-                .paragraphStyle: paragraph,
-            ]
-            NSString(string: cell.file.displayName).draw(in: cell.titleFrame, withAttributes: attributes)
+            if isSelected, let regions = selectionRects(at: index) {
+                drawTitleSelection(in: regions.title)
+            }
+            NSString(string: cell.file.displayName).draw(
+                in: cell.titleFrame,
+                withAttributes: titleAttributes(selected: isSelected)
+            )
         }
-    }
-
-    override func mouseMoved(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        updateHoveredCell(at: point)
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        updateHoveredCell(at: nil)
-        NSCursor.arrow.set()
     }
 
     override func mouseDown(with event: NSEvent) {
-        guard event.clickCount >= 2 else {
-            return
-        }
-
         let point = convert(event.locationInWindow, from: nil)
-        guard let file = cells.first(where: { $0.frame.contains(point) })?.file else {
+        guard let cell = cells.first(where: { $0.frame.contains(point) }) else {
+            selectedFileURL = nil
+            needsDisplay = true
             return
         }
 
-        onOpenFile?(file.url)
+        selectedFileURL = cell.file.url
+        needsDisplay = true
+        if event.clickCount >= 2 {
+            onOpenFile?(cell.file.url)
+        }
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -474,68 +455,103 @@ final class ZoneFilesView: NSView {
         ZoneMouseLog.logScrollView(scrollView, label: "ZoneFilesView.scrollWheel.after")
     }
 
-    private func drawHoverState(in frame: NSRect) {
-        let hoverRect = frame.insetBy(dx: 4, dy: 2)
-        let path = NSBezierPath(roundedRect: hoverRect, xRadius: 7, yRadius: 7)
-        NSColor.white.withAlphaComponent(0.14).setFill()
+    func fileFrame(at index: Int) -> NSRect? {
+        guard cells.indices.contains(index) else {
+            return nil
+        }
+        return cells[index].frame
+    }
+
+    func selectionRects(at index: Int) -> (icon: NSRect, title: NSRect)? {
+        guard cells.indices.contains(index) else {
+            return nil
+        }
+
+        let cell = cells[index]
+        let measuredTitle = NSString(string: cell.file.displayName).boundingRect(
+            with: NSSize(
+                width: max(0, cell.titleFrame.width - 8),
+                height: cell.titleFrame.height
+            ),
+            options: [.usesLineFragmentOrigin, .usesFontLeading, .truncatesLastVisibleLine],
+            attributes: titleAttributes(selected: true)
+        )
+        let titleWidth = min(cell.titleFrame.width, ceil(measuredTitle.width) + 8)
+        let titleHeight = min(cell.titleFrame.height, ceil(measuredTitle.height) + 2)
+
+        return (
+            icon: cell.iconFrame.insetBy(dx: -4, dy: -4),
+            title: NSRect(
+                x: cell.titleFrame.midX - titleWidth / 2,
+                y: cell.titleFrame.minY,
+                width: titleWidth,
+                height: titleHeight
+            )
+        )
+    }
+
+    private func drawIconSelection(in rect: NSRect) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5)
+        NSColor.black.withAlphaComponent(0.28).setFill()
         path.fill()
-        NSColor.white.withAlphaComponent(0.24).setStroke()
+        NSColor.white.withAlphaComponent(0.42).setStroke()
         path.lineWidth = 1
         path.stroke()
     }
 
-    private func updateHoveredCell(at point: NSPoint?) {
-        let newIndex: Int?
-        if let point {
-            newIndex = cells.firstIndex { $0.frame.contains(point) }
-        } else {
-            newIndex = nil
-        }
+    private func drawTitleSelection(in rect: NSRect) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4)
+        NSColor.controlAccentColor.setFill()
+        path.fill()
+    }
 
-        guard hoveredCellIndex != newIndex else {
-            return
-        }
+    private func titleAttributes(selected: Bool) -> [NSAttributedString.Key: Any] {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byTruncatingMiddle
 
-        let oldIndex = hoveredCellIndex
-        hoveredCellIndex = newIndex
-
-        if let oldIndex, cells.indices.contains(oldIndex) {
-            setNeedsDisplay(cells[oldIndex].frame)
-        }
-        if let newIndex, cells.indices.contains(newIndex) {
-            setNeedsDisplay(cells[newIndex].frame)
-            NSCursor.pointingHand.set()
-        } else {
-            NSCursor.arrow.set()
-        }
+        return [
+            .font: NSFont.systemFont(
+                ofSize: CGFloat(fileLayout.textSize),
+                weight: .medium
+            ),
+            .foregroundColor: selected
+                ? NSColor.white
+                : NSColor.white.withAlphaComponent(0.92),
+            .paragraphStyle: paragraph,
+        ]
     }
 
     private func rebuildCells() {
         guard bounds.width > 0 else {
             cells = []
-            hoveredCellIndex = nil
             return
         }
 
-        let columns = max(1, Int((bounds.width - padding) / cellWidth))
+        let iconSize = CGFloat(fileLayout.iconSize)
+        let cellSize = CGFloat(fileLayout.cellSize)
+        let edgeInset = CGFloat(fileLayout.edgeInset)
+        let columns = max(1, Int((bounds.width - edgeInset) / cellSize))
         frame.size.height = requiredHeight(forWidth: bounds.width)
         cells = files.enumerated().map { index, file in
             let row = index / columns
             let column = index % columns
-            let x = padding + CGFloat(column) * cellWidth
-            let y = padding + CGFloat(row) * cellHeight
-            let frame = NSRect(x: x, y: y, width: cellWidth, height: cellHeight)
+            let x = edgeInset + CGFloat(column) * cellSize
+            let y = edgeInset + CGFloat(row) * cellSize
+            let frame = NSRect(x: x, y: y, width: cellSize, height: cellSize)
             let iconFrame = NSRect(
                 x: frame.midX - iconSize / 2,
                 y: frame.minY,
                 width: iconSize,
                 height: iconSize
             )
-            let titleFrame = NSRect(x: frame.minX, y: iconFrame.maxY + 4, width: frame.width, height: 24)
+            let titleFrame = NSRect(
+                x: frame.minX,
+                y: iconFrame.maxY + 4,
+                width: frame.width,
+                height: CGFloat(fileLayout.titleHeight)
+            )
             return Cell(file: file, frame: frame, iconFrame: iconFrame, titleFrame: titleFrame)
-        }
-        if let hoveredCellIndex, !cells.indices.contains(hoveredCellIndex) {
-            self.hoveredCellIndex = nil
         }
     }
 
@@ -544,9 +560,11 @@ final class ZoneFilesView: NSView {
             return 0
         }
 
-        let columns = max(1, Int((width - padding) / cellWidth))
+        let cellSize = CGFloat(fileLayout.cellSize)
+        let edgeInset = CGFloat(fileLayout.edgeInset)
+        let columns = max(1, Int((width - edgeInset) / cellSize))
         let rows = Int(ceil(Double(files.count) / Double(columns)))
-        return padding * 2 + CGFloat(rows) * cellHeight
+        return edgeInset * 2 + CGFloat(rows) * cellSize
     }
 }
 
