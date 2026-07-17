@@ -22,7 +22,15 @@ public struct FinderDesktopIconLayout: Equatable, Sendable {
     }
 
     public var cellSize: Double {
-        max(iconSize + gridSpacing, iconSize + 4 + titleHeight)
+        let selectedIconBottomInset = 4.0
+        let titleGap = 6.0
+        let titleVerticalPadding = 2.0
+        let contentHeight = iconSize
+            + selectedIconBottomInset
+            + titleGap
+            + titleHeight
+            + titleVerticalPadding
+        return max(iconSize + gridSpacing, contentHeight)
     }
 
     public var edgeInset: Double {

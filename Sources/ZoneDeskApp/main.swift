@@ -357,7 +357,9 @@ final class ZoneFilesView: NSView {
         var file: ZoneStoredFile
         var frame: NSRect
         var iconFrame: NSRect
-        var titleFrame: NSRect
+        var titleLayout: ZoneFileTitleLayout
+        var titleDrawOrigin: NSPoint
+        var titleBackgroundFrame: NSRect
     }
 
     private var files: [ZoneStoredFile] = []
@@ -416,9 +418,9 @@ final class ZoneFilesView: NSView {
             if isSelected, let regions = selectionRects(at: index) {
                 drawTitleSelection(in: regions.title)
             }
-            NSString(string: cell.file.displayName).draw(
-                in: cell.titleFrame,
-                withAttributes: titleAttributes(selected: isSelected)
+            cell.titleLayout.draw(
+                at: cell.titleDrawOrigin,
+                alpha: isSelected ? 1 : 0.92
             )
         }
     }
@@ -478,26 +480,18 @@ final class ZoneFilesView: NSView {
         }
 
         let cell = cells[index]
-        let measuredTitle = NSString(string: cell.file.displayName).boundingRect(
-            with: NSSize(
-                width: max(0, cell.titleFrame.width - 8),
-                height: cell.titleFrame.height
-            ),
-            options: [.usesLineFragmentOrigin, .usesFontLeading, .truncatesLastVisibleLine],
-            attributes: titleAttributes(selected: true)
-        )
-        let titleWidth = min(cell.titleFrame.width, ceil(measuredTitle.width) + 8)
-        let titleHeight = min(cell.titleFrame.height, ceil(measuredTitle.height) + 2)
 
         return (
             icon: cell.iconFrame.insetBy(dx: -4, dy: -4),
-            title: NSRect(
-                x: cell.titleFrame.midX - titleWidth / 2,
-                y: cell.titleFrame.minY,
-                width: titleWidth,
-                height: titleHeight
-            )
+            title: cell.titleBackgroundFrame
         )
+    }
+
+    func titleLayout(at index: Int) -> ZoneFileTitleLayout? {
+        guard cells.indices.contains(index) else {
+            return nil
+        }
+        return cells[index].titleLayout
     }
 
     private func drawIconSelection(in rect: NSRect) {
@@ -515,23 +509,6 @@ final class ZoneFilesView: NSView {
         path.fill()
     }
 
-    private func titleAttributes(selected: Bool) -> [NSAttributedString.Key: Any] {
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.alignment = .center
-        paragraph.lineBreakMode = .byTruncatingMiddle
-
-        return [
-            .font: NSFont.systemFont(
-                ofSize: CGFloat(fileLayout.textSize),
-                weight: .medium
-            ),
-            .foregroundColor: selected
-                ? NSColor.white
-                : NSColor.white.withAlphaComponent(0.92),
-            .paragraphStyle: paragraph,
-        ]
-    }
-
     private func rebuildCells() {
         guard bounds.width > 0 else {
             cells = []
@@ -541,6 +518,10 @@ final class ZoneFilesView: NSView {
         let iconSize = CGFloat(fileLayout.iconSize)
         let cellSize = CGFloat(fileLayout.cellSize)
         let edgeInset = CGFloat(fileLayout.edgeInset)
+        let titleFont = NSFont.systemFont(
+            ofSize: CGFloat(fileLayout.textSize),
+            weight: .medium
+        )
         let columns = max(1, Int((bounds.width - edgeInset) / cellSize))
         frame.size.height = requiredHeight(forWidth: bounds.width)
         cells = files.enumerated().map { index, file in
@@ -555,13 +536,34 @@ final class ZoneFilesView: NSView {
                 width: iconSize,
                 height: iconSize
             )
-            let titleFrame = NSRect(
-                x: frame.minX,
-                y: iconFrame.maxY + 4,
-                width: frame.width,
-                height: CGFloat(fileLayout.titleHeight)
+            let titleLayout = ZoneFileTitleLayout.make(
+                displayName: file.displayName,
+                font: titleFont,
+                maxWidth: max(1, frame.width - 8)
             )
-            return Cell(file: file, frame: frame, iconFrame: iconFrame, titleFrame: titleFrame)
+            let iconSelectionRect = iconFrame.insetBy(dx: -4, dy: -4)
+            let titleBackgroundWidth = min(
+                frame.width,
+                ceil(titleLayout.textBounds.width) + 8
+            )
+            let titleBackgroundFrame = NSRect(
+                x: frame.midX - titleBackgroundWidth / 2,
+                y: iconSelectionRect.maxY + 6,
+                width: titleBackgroundWidth,
+                height: ceil(titleLayout.textBounds.height) + 2
+            )
+            let titleDrawOrigin = NSPoint(
+                x: frame.midX - titleLayout.textBounds.midX,
+                y: titleBackgroundFrame.minY + 1 - titleLayout.textBounds.minY
+            )
+            return Cell(
+                file: file,
+                frame: frame,
+                iconFrame: iconFrame,
+                titleLayout: titleLayout,
+                titleDrawOrigin: titleDrawOrigin,
+                titleBackgroundFrame: titleBackgroundFrame
+            )
         }
     }
 

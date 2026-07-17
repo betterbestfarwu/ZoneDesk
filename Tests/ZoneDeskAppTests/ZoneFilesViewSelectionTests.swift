@@ -55,6 +55,24 @@ struct ZoneFilesViewSelectionTests {
         #expect(regions.icon != cell)
         #expect(regions.title != cell)
         #expect(!regions.icon.intersects(regions.title))
+        #expect(regions.title.minY - regions.icon.maxY == 6)
+    }
+
+    @Test("names longer than two lines use a single middle-truncated title")
+    func overflowingTitleUsesMiddleTruncation() throws {
+        let fixture = try ZoneFilesViewFixture(fileCount: 1)
+        fixture.view.setFiles([
+            ZoneStoredFile(
+                url: fixture.files[0].url,
+                displayName: "这是一个非常非常长并且必须超过两行显示范围的文件名称2026-07-17.png",
+                category: .document
+            ),
+        ])
+        fixture.view.layoutSubtreeIfNeeded()
+
+        let title = try #require(fixture.view.titleLayout(at: 0))
+        #expect(title.lineCount == 1)
+        #expect(title.usesMiddleTruncation)
     }
 
     @Test("Finder layout controls zone cell and icon sizes")

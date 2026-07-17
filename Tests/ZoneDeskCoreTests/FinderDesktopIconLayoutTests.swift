@@ -49,6 +49,6 @@ struct FinderDesktopIconLayoutTests {
     @Test("keeps enough cell height for a two line title")
     func cellFitsTitle() {
         let layout = FinderDesktopIconLayout(iconSize: 32, gridSpacing: 0, textSize: 12)
-        #expect(layout.cellSize >= layout.iconSize + 4 + layout.titleHeight)
+        #expect(layout.cellSize >= layout.iconSize + 4 + 6 + layout.titleHeight + 2)
     }
 }
