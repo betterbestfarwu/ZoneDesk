@@ -30,16 +30,139 @@ struct ZoneViewScrollingTests {
         #expect(rect.maxY <= visibleFrame.maxY)
     }
 
-    @Test("shows zone actions only while editing and enables delete for a selection")
+    @Test("shows only add and rename actions while editing")
     func reportsZoneEditMenuState() {
         let inactive = ZoneEditMenuState(isEditing: false, hasSelection: false)
         let editingWithoutSelection = ZoneEditMenuState(isEditing: true, hasSelection: false)
         let editingWithSelection = ZoneEditMenuState(isEditing: true, hasSelection: true)
 
-        #expect(!inactive.showsActions)
-        #expect(editingWithoutSelection.showsActions)
-        #expect(!editingWithoutSelection.canDelete)
-        #expect(editingWithSelection.canDelete)
+        #expect(inactive.actions.isEmpty)
+        #expect(editingWithoutSelection.actions == [.add, .rename])
+        #expect(editingWithSelection.actions == [.add, .rename])
+        #expect(!editingWithoutSelection.canRename)
+        #expect(editingWithSelection.canRename)
+    }
+
+    @Test("editing menu contains add and rename items without delete")
+    func editingMenuContainsAddAndRenameItemsWithoutDelete() {
+        let state = ZoneEditMenuState(isEditing: true, hasSelection: true)
+        let items = state.menuItems(
+            addAction: NSSelectorFromString("addZone"),
+            renameAction: NSSelectorFromString("renameSelectedZone")
+        )
+
+        #expect(items.map(\.title) == ["新增分区…", "重命名当前分区…"])
+        #expect(!items.contains(where: { $0.title == "删除当前分区…" }))
+    }
+
+    @Test("delete button falls back to text when the symbol is unavailable")
+    func deleteButtonFallsBackToTextWhenSymbolIsUnavailable() {
+        let button = ZoneView.makeDeleteButton(image: nil, target: nil, action: nil)
+
+        #expect(button.image == nil)
+        #expect(button.title == "删除")
+        #expect(button.imagePosition == .noImage)
+    }
+
+    @Test("shows the delete button only while editing")
+    func showsDeleteButtonOnlyWhileEditing() throws {
+        let zone = ZoneModel(
+            name: "文档",
+            rect: ZoneRect(x: 0, y: 0, width: 300, height: 220),
+            acceptedCategories: [.document],
+            locked: false
+        )
+        let view = ZoneView(zone: zone)
+        let button = try #require(deleteButton(in: view))
+
+        #expect(button.isHidden)
+
+        view.update(zone: zone, isEditing: true, isSelected: false)
+
+        #expect(!button.isHidden)
+        #expect(button.toolTip == "删除分区")
+        #expect(button.accessibilityLabel() == "删除分区")
+    }
+
+    @Test("delete button reports its own zone identifier")
+    func deleteButtonReportsItsOwnZoneIdentifier() throws {
+        let zone = ZoneModel(
+            name: "文档",
+            rect: ZoneRect(x: 0, y: 0, width: 300, height: 220),
+            acceptedCategories: [.document],
+            locked: false
+        )
+        let view = ZoneView(zone: zone)
+        var deletedZoneID: UUID?
+        view.onDelete = { deletedZoneID = $0 }
+        view.update(zone: zone, isEditing: true, isSelected: false)
+
+        try #require(deleteButton(in: view)).performClick(nil)
+
+        #expect(deletedZoneID == zone.id)
+    }
+
+    @Test("zone window forwards delete requests")
+    func zoneWindowForwardsDeleteRequests() throws {
+        let zone = ZoneModel(
+            name: "文档",
+            rect: ZoneRect(x: 0, y: 0, width: 300, height: 220),
+            acceptedCategories: [.document],
+            locked: false
+        )
+        let window = ZoneWindow(zone: zone)
+        var deletedZoneID: UUID?
+        window.onDelete = { deletedZoneID = $0 }
+        window.update(zone: zone, isEditing: true, isSelected: false, files: [])
+        let view = try #require(window.contentView as? ZoneView)
+
+        try #require(deleteButton(in: view)).performClick(nil)
+
+        #expect(deletedZoneID == zone.id)
+    }
+
+    @Test("window manager forwards delete requests")
+    func windowManagerForwardsDeleteRequests() throws {
+        let zone = ZoneModel(
+            name: "文档",
+            rect: ZoneRect(x: 0, y: 0, width: 300, height: 220),
+            acceptedCategories: [.document],
+            locked: false
+        )
+        let manager = WindowManager()
+        defer { manager.closeAll() }
+        var deletedZoneID: UUID?
+        manager.onDeleteRequested = { deletedZoneID = $0 }
+        manager.setEditing(true, zones: [zone])
+        let window = try #require(
+            NSApplication.shared.windows
+                .compactMap { $0 as? ZoneWindow }
+                .first(where: { $0.zone.id == zone.id })
+        )
+        let view = try #require(window.contentView as? ZoneView)
+
+        try #require(deleteButton(in: view)).performClick(nil)
+
+        #expect(deletedZoneID == zone.id)
+    }
+
+    @Test("delete button reserves title space and wins hit testing")
+    func deleteButtonReservesTitleSpaceAndWinsHitTesting() throws {
+        let zone = ZoneModel(
+            name: "一个非常长的分区标题",
+            rect: ZoneRect(x: 0, y: 0, width: 300, height: 220),
+            acceptedCategories: [.document],
+            locked: false
+        )
+        let view = ZoneView(zone: zone)
+        view.frame = NSRect(x: 0, y: 0, width: 300, height: 220)
+        view.update(zone: zone, isEditing: true, isSelected: false)
+        view.layoutSubtreeIfNeeded()
+        let button = try #require(deleteButton(in: view))
+        let titleRect = view.titleDrawingRect(in: view.bounds.insetBy(dx: 2, dy: 2))
+
+        #expect(titleRect.maxX < button.frame.minX)
+        #expect(view.hitTest(NSPoint(x: button.frame.midX, y: button.frame.midY)) === button)
     }
 
     @Test("zone window accepts mouse events")
@@ -737,6 +860,12 @@ struct ZoneViewScrollingTests {
         scroller.mouseDragged(with: dragEvent)
 
         #expect(scrollView.contentView.bounds.origin.y > 0)
+    }
+
+    private func deleteButton(in view: ZoneView) -> NSButton? {
+        view.subviews
+            .compactMap { $0 as? NSButton }
+            .first(where: { $0.toolTip == "删除分区" })
     }
 
     private func enterZone(_ view: ZoneView, in window: NSWindow? = nil) throws {

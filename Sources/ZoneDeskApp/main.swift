@@ -52,16 +52,34 @@ enum ZonePlacement {
     }
 }
 
+enum ZoneEditAction: Equatable {
+    case add
+    case rename
+}
+
 struct ZoneEditMenuState {
     var isEditing: Bool
     var hasSelection: Bool
 
-    var showsActions: Bool {
-        isEditing
+    var actions: [ZoneEditAction] {
+        isEditing ? [.add, .rename] : []
     }
 
-    var canDelete: Bool {
+    var canRename: Bool {
         isEditing && hasSelection
+    }
+
+    func menuItems(addAction: Selector, renameAction: Selector) -> [NSMenuItem] {
+        actions.map { action in
+            switch action {
+            case .add:
+                return NSMenuItem(title: "新增分区…", action: addAction, keyEquivalent: "n")
+            case .rename:
+                let item = NSMenuItem(title: "重命名当前分区…", action: renameAction, keyEquivalent: "t")
+                item.isEnabled = canRename
+                return item
+            }
+        }
     }
 }
 
@@ -128,6 +146,7 @@ final class ZoneWindow: NSWindow {
 
     var onSelect: ((UUID) -> Void)?
     var onRename: ((UUID) -> Void)?
+    var onDelete: ((UUID) -> Void)?
     var onZoneChanged: ((ZoneModel) -> Void)?
     var onOpenFile: ((URL) -> Void)? {
         didSet {
@@ -168,6 +187,9 @@ final class ZoneWindow: NSWindow {
         }
         zoneView.onRename = { [weak self] zoneID in
             self?.onRename?(zoneID)
+        }
+        zoneView.onDelete = { [weak self] zoneID in
+            self?.onDelete?(zoneID)
         }
         zoneView.onFrameChanged = { [weak self] rect in
             guard let self else {
@@ -618,9 +640,52 @@ final class ZoneView: NSView {
     private let minimumSize = NSSize(width: 160, height: 120)
     private let filesScrollView = ZoneScrollView()
     private let filesView = ZoneFilesView()
+    private lazy var deleteButton = Self.makeDeleteButton(
+        image: NSImage(
+            systemSymbolName: "trash",
+            accessibilityDescription: "删除分区"
+        ),
+        target: self,
+        action: #selector(deleteZone)
+    )
+
+    static func makeDeleteButton(image: NSImage?, target: Any?, action: Selector?) -> NSButton {
+        let button: NSButton
+        if let image {
+            button = NSButton(
+                image: image,
+                target: target,
+                action: action
+            )
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleProportionallyDown
+        } else {
+            button = NSButton(
+                title: "删除",
+                target: target,
+                action: action
+            )
+            button.imagePosition = .noImage
+            button.attributedTitle = NSAttributedString(
+                string: "删除",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
+                    .foregroundColor: NSColor.white,
+                ]
+            )
+        }
+        button.isBordered = false
+        button.contentTintColor = .white
+        button.focusRingType = .none
+        button.toolTip = "删除分区"
+        button.setAccessibilityLabel("删除分区")
+        button.isHidden = true
+        return button
+    }
 
     var onSelect: ((UUID) -> Void)?
     var onRename: ((UUID) -> Void)?
+    var onDelete: ((UUID) -> Void)?
     var onFrameChanged: ((ZoneRect) -> Void)?
     var onOpenFile: ((URL) -> Void)? {
         get { filesView.onOpenFile }
@@ -641,6 +706,7 @@ final class ZoneView: NSView {
         filesScrollView.borderType = .noBorder
         filesScrollView.documentView = filesView
         addSubview(filesScrollView)
+        addSubview(deleteButton)
     }
 
     @available(*, unavailable)
@@ -653,6 +719,7 @@ final class ZoneView: NSView {
         self.isEditing = isEditing
         self.isSelected = isSelected
         filesScrollView.isHidden = isEditing
+        deleteButton.isHidden = !isEditing
         updateScrollerVisibility()
         needsDisplay = true
     }
@@ -687,6 +754,12 @@ final class ZoneView: NSView {
             y: 8,
             width: max(0, bounds.width - 16),
             height: max(0, bounds.height - contentTopInset - 8)
+        )
+        deleteButton.frame = NSRect(
+            x: max(0, bounds.maxX - 28),
+            y: max(0, bounds.maxY - 24),
+            width: 20,
+            height: 20
         )
         filesView.frame.size = NSSize(
             width: filesScrollView.contentSize.width,
@@ -792,6 +865,10 @@ final class ZoneView: NSView {
         true
     }
 
+    @objc private func deleteZone() {
+        onDelete?(zone.id)
+    }
+
     private func updateScrollerVisibility() {
         let contentOverflows = filesView.frame.height > filesScrollView.contentSize.height + 0.5
         filesScrollView.showsZoneScroller = isPointerInside && !isEditing && contentOverflows
@@ -841,8 +918,18 @@ final class ZoneView: NSView {
         ]
 
         NSString(string: zone.name).draw(
-            in: NSRect(x: rect.minX + 12, y: rect.maxY - 20, width: rect.width - 24, height: 14),
+            in: titleDrawingRect(in: rect),
             withAttributes: attributes
+        )
+    }
+
+    func titleDrawingRect(in rect: NSRect) -> NSRect {
+        let horizontalInset: CGFloat = isEditing ? 34 : 12
+        return NSRect(
+            x: rect.minX + horizontalInset,
+            y: rect.maxY - 20,
+            width: max(0, rect.width - horizontalInset * 2),
+            height: 14
         )
     }
 
@@ -896,6 +983,7 @@ final class WindowManager {
 
     var onZoneChanged: ((ZoneModel) -> Void)?
     var onRenameRequested: ((UUID) -> Void)?
+    var onDeleteRequested: ((UUID) -> Void)?
     var onSelectionChanged: (() -> Void)?
     var onOpenFile: ((URL) -> Void)?
 
@@ -912,6 +1000,9 @@ final class WindowManager {
             }
             window.onRename = { [weak self] zoneID in
                 self?.onRenameRequested?(zoneID)
+            }
+            window.onDelete = { [weak self] zoneID in
+                self?.onDeleteRequested?(zoneID)
             }
             window.onZoneChanged = { [weak self] zone in
                 self?.onZoneChanged?(zone)
@@ -1121,16 +1212,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             isEditing: isEditingZones,
             hasSelection: windowManager.selectedZone(in: config.zones) != nil
         )
-        if editMenuState.showsActions {
-            menu.addItem(NSMenuItem(title: "新增分区…", action: #selector(addZone), keyEquivalent: "n"))
-
-            let renameItem = NSMenuItem(title: "重命名当前分区…", action: #selector(renameSelectedZone), keyEquivalent: "t")
-            renameItem.isEnabled = editMenuState.hasSelection
-            menu.addItem(renameItem)
-
-            let deleteItem = NSMenuItem(title: "删除当前分区…", action: #selector(deleteSelectedZone), keyEquivalent: "")
-            deleteItem.isEnabled = editMenuState.canDelete
-            menu.addItem(deleteItem)
+        for item in editMenuState.menuItems(
+            addAction: #selector(addZone),
+            renameAction: #selector(renameSelectedZone)
+        ) {
+            menu.addItem(item)
         }
 
         menu.addItem(NSMenuItem.separator())
@@ -1148,6 +1234,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         windowManager.onRenameRequested = { [weak self] zoneID in
             self?.renameZone(id: zoneID)
+        }
+        windowManager.onDeleteRequested = { [weak self] zoneID in
+            self?.deleteZone(id: zoneID)
         }
         windowManager.onSelectionChanged = { [weak self] in
             self?.rebuildMenu()
@@ -1411,8 +1500,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
-    @objc private func deleteSelectedZone() {
-        guard let zone = windowManager.selectedZone(in: config.zones) else {
+    private func deleteZone(id: UUID) {
+        guard let zone = config.zones.first(where: { $0.id == id }) else {
             return
         }
 
