@@ -1,0 +1,324 @@
+import Foundation
+
+public struct ZoneStoredFile: Equatable, Sendable {
+    public var url: URL
+    public var displayName: String
+    public var category: FileCategory
+
+    public init(url: URL, displayName: String, category: FileCategory) {
+        self.url = url
+        self.displayName = displayName
+        self.category = category
+    }
+}
+
+public struct ZoneCollectionMove: Equatable, Sendable {
+    public var source: URL
+    public var destination: URL
+    public var zoneID: UUID
+
+    public init(source: URL, destination: URL, zoneID: UUID) {
+        self.source = source
+        self.destination = destination
+        self.zoneID = zoneID
+    }
+}
+
+public struct ZoneCollectionFailure: Equatable, Sendable {
+    public var source: URL
+    public var message: String
+
+    public init(source: URL, message: String) {
+        self.source = source
+        self.message = message
+    }
+}
+
+public struct ZoneCollectionReport: Equatable, Sendable {
+    public var moves: [ZoneCollectionMove]
+    public var failures: [ZoneCollectionFailure]
+
+    public init(moves: [ZoneCollectionMove] = [], failures: [ZoneCollectionFailure] = []) {
+        self.moves = moves
+        self.failures = failures
+    }
+}
+
+public struct ZoneRestoreMove: Equatable, Sendable {
+    public var source: URL
+    public var destination: URL
+
+    public init(source: URL, destination: URL) {
+        self.source = source
+        self.destination = destination
+    }
+}
+
+public struct ZoneRestoreFailure: Equatable, Sendable {
+    public var source: URL
+    public var message: String
+
+    public init(source: URL, message: String) {
+        self.source = source
+        self.message = message
+    }
+}
+
+public struct ZoneRestoreReport: Equatable, Sendable {
+    public var moves: [ZoneRestoreMove]
+    public var failures: [ZoneRestoreFailure]
+
+    public init(moves: [ZoneRestoreMove] = [], failures: [ZoneRestoreFailure] = []) {
+        self.moves = moves
+        self.failures = failures
+    }
+
+    public var completed: Bool {
+        failures.isEmpty
+    }
+}
+
+public enum ZoneLibraryError: Error, Equatable, CustomStringConvertible {
+    case destinationDirectoryExists(URL)
+
+    public var description: String {
+        switch self {
+        case let .destinationDirectoryExists(url):
+            return "Destination zone directory already exists: \(url.path)"
+        }
+    }
+}
+
+public struct ZoneLibrary {
+    public var rootURL: URL
+    public var fileManager: FileManager
+
+    public init(rootURL: URL? = nil, fileManager: FileManager = .default) {
+        self.rootURL = rootURL ?? Self.defaultRootURL()
+        self.fileManager = fileManager
+    }
+
+    public static func defaultRootURL() -> URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ZoneDesk Library", isDirectory: true)
+    }
+
+    public func directoryURL(for zone: ZoneModel) -> URL {
+        rootURL.appendingPathComponent(safeDirectoryName(for: zone), isDirectory: true)
+    }
+
+    public func ensureDirectory(for zone: ZoneModel) throws -> URL {
+        let directory = directoryURL(for: zone)
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
+    public func createDirectory(for zone: ZoneModel) throws -> URL {
+        let directory = directoryURL(for: zone)
+        guard !fileManager.fileExists(atPath: directory.path) else {
+            throw ZoneLibraryError.destinationDirectoryExists(directory)
+        }
+
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
+    public func ensureDirectories(for zones: [ZoneModel]) throws {
+        for zone in zones {
+            _ = try ensureDirectory(for: zone)
+        }
+    }
+
+    public func renameDirectory(from oldZone: ZoneModel, to newZone: ZoneModel) throws {
+        let oldURL = directoryURL(for: oldZone)
+        let newURL = directoryURL(for: newZone)
+        guard oldURL != newURL else {
+            _ = try ensureDirectory(for: newZone)
+            return
+        }
+
+        guard fileManager.fileExists(atPath: oldURL.path) else {
+            _ = try ensureDirectory(for: newZone)
+            return
+        }
+
+        guard !fileManager.fileExists(atPath: newURL.path) else {
+            throw ZoneLibraryError.destinationDirectoryExists(newURL)
+        }
+
+        try fileManager.moveItem(at: oldURL, to: newURL)
+    }
+
+    public func files(in zone: ZoneModel) throws -> [ZoneStoredFile] {
+        let directory = try ensureDirectory(for: zone)
+        let urls = try fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isHiddenKey],
+            options: [.skipsPackageDescendants]
+        )
+
+        return urls.compactMap { url in
+            guard !url.lastPathComponent.hasPrefix(".") else {
+                return nil
+            }
+
+            return ZoneStoredFile(
+                url: url,
+                displayName: url.lastPathComponent,
+                category: DesktopFileClassifier.classify(url: url)
+            )
+        }
+        .sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
+    }
+
+    public func collectDesktopFiles(from desktopURL: URL, zones: [ZoneModel]) -> ZoneCollectionReport {
+        var moves: [ZoneCollectionMove] = []
+        var failures: [ZoneCollectionFailure] = []
+        let zoneByCategory = Dictionary(
+            zones.flatMap { zone in zone.acceptedCategories.map { ($0, zone) } },
+            uniquingKeysWith: { first, _ in first }
+        )
+
+        let desktopFiles: [URL]
+        do {
+            desktopFiles = try fileManager.contentsOfDirectory(
+                at: desktopURL,
+                includingPropertiesForKeys: [.isHiddenKey],
+                options: [.skipsPackageDescendants]
+            )
+        } catch {
+            return ZoneCollectionReport(
+                failures: [ZoneCollectionFailure(source: desktopURL, message: String(describing: error))]
+            )
+        }
+
+        for source in desktopFiles.sorted(by: { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }) {
+            guard !source.lastPathComponent.hasPrefix(".") else {
+                continue
+            }
+
+            let category = DesktopFileClassifier.classify(url: source)
+            guard let zone = zoneByCategory[category] else {
+                continue
+            }
+
+            do {
+                let directory = try ensureDirectory(for: zone)
+                let destination = uniqueDestinationURL(
+                    in: directory,
+                    preferredName: source.lastPathComponent
+                )
+                try fileManager.moveItem(at: source, to: destination)
+                moves.append(ZoneCollectionMove(source: source, destination: destination, zoneID: zone.id))
+            } catch {
+                failures.append(ZoneCollectionFailure(source: source, message: String(describing: error)))
+            }
+        }
+
+        return ZoneCollectionReport(moves: moves, failures: failures)
+    }
+
+    public func restoreZoneToDesktop(
+        _ zone: ZoneModel,
+        desktopURL: URL
+    ) -> ZoneRestoreReport {
+        let directory = directoryURL(for: zone)
+        guard fileManager.fileExists(atPath: directory.path) else {
+            return ZoneRestoreReport()
+        }
+
+        let storedURLs: [URL]
+        do {
+            storedURLs = try fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsPackageDescendants]
+            )
+        } catch {
+            return ZoneRestoreReport(
+                failures: [
+                    ZoneRestoreFailure(source: directory, message: String(describing: error)),
+                ]
+            )
+        }
+
+        var moves: [ZoneRestoreMove] = []
+        var failures: [ZoneRestoreFailure] = []
+        for source in storedURLs.sorted(by: {
+            $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+        }) {
+            let destination = uniqueDestinationURL(
+                in: desktopURL,
+                preferredName: source.lastPathComponent
+            )
+
+            do {
+                try fileManager.moveItem(at: source, to: destination)
+                moves.append(ZoneRestoreMove(source: source, destination: destination))
+            } catch {
+                failures.append(
+                    ZoneRestoreFailure(source: source, message: String(describing: error))
+                )
+            }
+        }
+
+        guard failures.isEmpty else {
+            return ZoneRestoreReport(moves: moves, failures: failures)
+        }
+
+        do {
+            let remainingURLs = try fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil
+            )
+            guard remainingURLs.isEmpty else {
+                return ZoneRestoreReport(
+                    moves: moves,
+                    failures: [
+                        ZoneRestoreFailure(
+                            source: directory,
+                            message: "Zone directory is not empty after restoring its contents."
+                        ),
+                    ]
+                )
+            }
+            try fileManager.removeItem(at: directory)
+        } catch {
+            failures.append(
+                ZoneRestoreFailure(source: directory, message: String(describing: error))
+            )
+        }
+
+        return ZoneRestoreReport(moves: moves, failures: failures)
+    }
+
+    private func safeDirectoryName(for zone: ZoneModel) -> String {
+        let trimmed = zone.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = zone.id.uuidString
+        let name = trimmed.isEmpty ? fallback : trimmed
+        let invalidCharacters = CharacterSet(charactersIn: "/:")
+        return name
+            .components(separatedBy: invalidCharacters)
+            .joined(separator: "-")
+    }
+
+    private func uniqueDestinationURL(in directory: URL, preferredName: String) -> URL {
+        let preferredURL = directory.appendingPathComponent(preferredName)
+        guard !fileManager.fileExists(atPath: preferredURL.path) else {
+            let base = (preferredName as NSString).deletingPathExtension
+            let ext = (preferredName as NSString).pathExtension
+
+            var index = 2
+            while true {
+                let candidateName = ext.isEmpty ? "\(base) \(index)" : "\(base) \(index).\(ext)"
+                let candidate = directory.appendingPathComponent(candidateName)
+                if !fileManager.fileExists(atPath: candidate.path) {
+                    return candidate
+                }
+                index += 1
+            }
+        }
+
+        return preferredURL
+    }
+}
