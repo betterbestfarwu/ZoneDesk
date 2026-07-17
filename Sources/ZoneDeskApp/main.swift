@@ -1,6 +1,7 @@
 import AppKit
 import CoreServices
 import Foundation
+import QuickLookUI
 import ZoneDeskCore
 
 enum ZonePlacement {
@@ -162,6 +163,10 @@ final class ZoneWindow: NSWindow {
         get { zoneView.onPresentFileError }
         set { zoneView.onPresentFileError = newValue }
     }
+    var onRefreshFiles: ((UUID) -> Void)? {
+        get { zoneView.onRefreshFiles }
+        set { zoneView.onRefreshFiles = newValue }
+    }
 
     override var canBecomeKey: Bool {
         true
@@ -234,7 +239,7 @@ final class ZoneWindow: NSWindow {
         }
     }
 
-    func beginRenamingFile(at url: URL) {
+    func beginRenamingFile(at url: URL) -> Bool {
         zoneView.beginRenamingFile(at: url)
     }
 
@@ -445,6 +450,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
     private var renameEditor: NSTextField?
     private var renamingFileURL: URL?
     private weak var renameCommandEditor: NSTextField?
+    private var quickLookDataSource: ZoneQuickLookDataSource?
     private(set) var selectedFileURL: URL?
     var zoneID = UUID()
     var fileSortOrder: ZoneFileSortOrder = .name
@@ -469,6 +475,11 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
     var onOpenFile: ((URL) -> Void)?
     var onRenameFile: ((URL, String) -> Result<URL, Error>)?
     var onPresentError: ((String) -> Void)?
+    var onRefreshFiles: ((UUID) -> Void)?
+
+    var quickLookDataSourceForTesting: ZoneQuickLookDataSource? {
+        quickLookDataSource
+    }
 
     var isRenamingFile: Bool {
         renameEditor != nil
@@ -488,6 +499,10 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
     }
 
     override var isFlipped: Bool {
+        true
+    }
+
+    override var acceptsFirstResponder: Bool {
         true
     }
 
@@ -654,10 +669,13 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         return cells[index].thumbnailRequestKey?.url
     }
 
-    func beginRenaming(url: URL) {
+    @discardableResult
+    func beginRenaming(url: URL) -> Bool {
         layoutSubtreeIfNeeded()
         guard let cell = cells.first(where: { $0.file.url == url }) else {
-            return
+            onRefreshFiles?(zoneID)
+            onPresentError?("项目已移动或删除，已请求刷新分区。")
+            return false
         }
 
         cancelRenaming()
@@ -695,6 +713,52 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
             length: selectionLength
         )
         setNeedsDisplay(cell.frame)
+        return true
+    }
+
+    func prepareQuickLook(url: URL) {
+        quickLookDataSource = ZoneQuickLookDataSource(url: url)
+    }
+
+    func presentQuickLook(url: URL) {
+        prepareQuickLook(url: url)
+        guard let window else {
+            quickLookDataSource = nil
+            onPresentError?("无法快速查看：分区窗口已关闭。")
+            return
+        }
+
+        window.makeFirstResponder(self)
+        window.makeKey()
+        let panel = QLPreviewPanel.shared()!
+        panel.updateController()
+        guard (panel.currentController as AnyObject?) === self else {
+            quickLookDataSource = nil
+            onPresentError?("无法获取快速查看控制权。")
+            return
+        }
+        beginPreviewPanelControl(panel)
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
+        quickLookDataSource != nil
+    }
+
+    override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        guard let quickLookDataSource else {
+            return
+        }
+        panel.dataSource = quickLookDataSource
+        panel.currentPreviewItemIndex = 0
+        panel.reloadData()
+    }
+
+    override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        if panel.dataSource === quickLookDataSource {
+            panel.dataSource = nil
+        }
+        quickLookDataSource = nil
     }
 
     func cancelRenaming() {
@@ -1093,6 +1157,10 @@ final class ZoneView: NSView {
         get { filesView.onPresentError }
         set { filesView.onPresentError = newValue }
     }
+    var onRefreshFiles: ((UUID) -> Void)? {
+        get { filesView.onRefreshFiles }
+        set { filesView.onRefreshFiles = newValue }
+    }
 
     init(
         zone: ZoneModel,
@@ -1135,7 +1203,7 @@ final class ZoneView: NSView {
         needsDisplay = true
     }
 
-    func beginRenamingFile(at url: URL) {
+    func beginRenamingFile(at url: URL) -> Bool {
         filesView.beginRenaming(url: url)
     }
 
@@ -1389,6 +1457,297 @@ final class ZoneView: NSView {
     }
 }
 
+struct ZoneFileOperationEnvironment {
+    var currentConfig: () -> AppConfig
+    var saveConfig: (AppConfig) throws -> Void
+    var applyConfig: (AppConfig) -> Void
+    var cachedFiles: (UUID) -> [ZoneStoredFile]
+    var installFiles: (ZoneModel, [ZoneStoredFile]) -> Void
+    var scanFiles: (ZoneModel) throws -> [ZoneStoredFile]
+    var directoryURL: (ZoneModel) -> URL
+    var fileExists: (URL) -> Bool
+    var createFolder: (ZoneModel) throws -> URL
+    var renameItem: (URL, String, ZoneModel) throws -> URL
+    var trashItem: (URL) throws -> Void
+    var beginRenaming: (URL, UUID) -> Bool
+    var noteRefreshAttempt: (UUID) -> Void
+    var presentError: (String, String) -> Void
+}
+
+private enum ZoneFileOperationError: LocalizedError {
+    case missingZone(UUID)
+    case missingDirectory(URL)
+    case missingItem(URL)
+    case itemOutsideZone(URL)
+    case refreshFailed(Error)
+    case renameTargetUnavailable(URL)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingZone:
+            return "找不到该项目所属的分区。"
+        case let .missingDirectory(url):
+            return "分区目录不存在：\(url.path)"
+        case let .missingItem(url):
+            return "项目已移动或删除：\(url.lastPathComponent)"
+        case let .itemOutsideZone(url):
+            return "项目已不在当前分区中：\(url.lastPathComponent)"
+        case let .refreshFailed(error):
+            return error.localizedDescription
+        case let .renameTargetUnavailable(url):
+            return "无法在刷新后找到项目：\(url.lastPathComponent)"
+        }
+    }
+}
+
+@MainActor
+final class ZoneFileOperationCoordinator {
+    private let environment: ZoneFileOperationEnvironment
+
+    init(environment: ZoneFileOperationEnvironment) {
+        self.environment = environment
+    }
+
+    @discardableResult
+    func refresh(zoneID: UUID) -> Result<[ZoneStoredFile], Error> {
+        environment.noteRefreshAttempt(zoneID)
+        guard let zone = environment.currentConfig().zones.first(where: { $0.id == zoneID }) else {
+            return .failure(ZoneFileOperationError.missingZone(zoneID))
+        }
+
+        do {
+            let files = ZoneStoredFileSorter.sorted(
+                try environment.scanFiles(zone),
+                by: zone.fileSortOrder
+            )
+            environment.installFiles(zone, files)
+            return .success(files)
+        } catch {
+            return .failure(ZoneFileOperationError.refreshFailed(error))
+        }
+    }
+
+    func validateItem(zoneID: UUID, url: URL) -> Bool {
+        switch validatedItem(zoneID: zoneID, url: url) {
+        case .success:
+            return true
+        case let .failure(error):
+            rejectStaleContext(zoneID: zoneID, error: error)
+            return false
+        }
+    }
+
+    @discardableResult
+    func createFolder(in zoneID: UUID) -> Result<URL, Error> {
+        guard let zone = validatedZone(zoneID: zoneID, requireDirectory: true) else {
+            return .failure(ZoneFileOperationError.missingZone(zoneID))
+        }
+
+        do {
+            let url = try environment.createFolder(zone)
+            switch refresh(zoneID: zoneID) {
+            case .success:
+                break
+            case let .failure(error):
+                var files = environment.cachedFiles(zoneID)
+                files.removeAll(where: { $0.url.standardizedFileURL == url.standardizedFileURL })
+                files.append(ZoneStoredFile(
+                    url: url,
+                    displayName: url.lastPathComponent,
+                    category: .other,
+                    isDirectory: true
+                ))
+                installCached(files, for: zone)
+                presentRefreshFallback(error)
+            }
+
+            guard environment.beginRenaming(url, zoneID) else {
+                let error = ZoneFileOperationError.renameTargetUnavailable(url)
+                rejectStaleContext(zoneID: zoneID, error: error)
+                return .failure(error)
+            }
+            return .success(url)
+        } catch {
+            environment.presentError("无法新建文件夹", error.localizedDescription)
+            return .failure(error)
+        }
+    }
+
+    @discardableResult
+    func changeSortOrder(
+        _ order: ZoneFileSortOrder,
+        in zoneID: UUID
+    ) -> Result<[ZoneStoredFile], Error> {
+        let currentConfig = environment.currentConfig()
+        guard let index = currentConfig.zones.firstIndex(where: { $0.id == zoneID }) else {
+            let error = ZoneFileOperationError.missingZone(zoneID)
+            rejectStaleContext(zoneID: zoneID, error: error)
+            return .failure(error)
+        }
+
+        var updatedConfig = currentConfig
+        updatedConfig.zones[index].fileSortOrder = order
+        do {
+            try environment.saveConfig(updatedConfig)
+        } catch {
+            environment.presentError(
+                "无法更改排序方式",
+                "配置保存失败，已保留原排序。\n\(error.localizedDescription)"
+            )
+            return .failure(error)
+        }
+
+        environment.applyConfig(updatedConfig)
+        let updatedZone = updatedConfig.zones[index]
+        let cachedFiles = ZoneStoredFileSorter.sorted(
+            environment.cachedFiles(zoneID),
+            by: order
+        )
+        environment.installFiles(updatedZone, cachedFiles)
+
+        switch refresh(zoneID: zoneID) {
+        case let .success(files):
+            return .success(files)
+        case let .failure(error):
+            presentRefreshFallback(error)
+            return .success(cachedFiles)
+        }
+    }
+
+    func renameItem(
+        _ url: URL,
+        to newName: String,
+        in zoneID: UUID
+    ) -> Result<URL, Error> {
+        let zone: ZoneModel
+        switch validatedItem(zoneID: zoneID, url: url) {
+        case let .success(validatedZone):
+            zone = validatedZone
+        case let .failure(error):
+            rejectStaleContext(zoneID: zoneID, error: error)
+            return .failure(error)
+        }
+
+        do {
+            let renamedURL = try environment.renameItem(url, newName, zone)
+            switch refresh(zoneID: zoneID) {
+            case .success:
+                break
+            case let .failure(error):
+                var files = environment.cachedFiles(zoneID)
+                if let index = files.firstIndex(where: {
+                    $0.url.standardizedFileURL == url.standardizedFileURL
+                }) {
+                    files[index].url = renamedURL
+                    files[index].displayName = renamedURL.lastPathComponent
+                } else {
+                    files.append(ZoneStoredFile(
+                        url: renamedURL,
+                        displayName: renamedURL.lastPathComponent,
+                        category: DesktopFileClassifier.classify(url: renamedURL)
+                    ))
+                }
+                installCached(files, for: zone)
+                presentRefreshFallback(error)
+            }
+            return .success(renamedURL)
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    @discardableResult
+    func trash(_ url: URL, in zoneID: UUID) -> Result<Void, Error> {
+        let zone: ZoneModel
+        switch validatedItem(zoneID: zoneID, url: url) {
+        case let .success(validatedZone):
+            zone = validatedZone
+        case let .failure(error):
+            rejectStaleContext(zoneID: zoneID, error: error)
+            return .failure(error)
+        }
+
+        do {
+            try environment.trashItem(url)
+            switch refresh(zoneID: zoneID) {
+            case .success:
+                break
+            case let .failure(error):
+                let files = environment.cachedFiles(zoneID).filter {
+                    $0.url.standardizedFileURL != url.standardizedFileURL
+                }
+                installCached(files, for: zone)
+                presentRefreshFallback(error)
+            }
+            return .success(())
+        } catch {
+            environment.presentError("无法移到废纸篓", error.localizedDescription)
+            return .failure(error)
+        }
+    }
+
+    private func validatedItem(zoneID: UUID, url: URL) -> Result<ZoneModel, Error> {
+        let config = environment.currentConfig()
+        guard let zone = config.zones.first(where: { $0.id == zoneID }) else {
+            return .failure(ZoneFileOperationError.missingZone(zoneID))
+        }
+
+        let directory = environment.directoryURL(zone).standardizedFileURL
+        guard environment.fileExists(directory) else {
+            return .failure(ZoneFileOperationError.missingDirectory(directory))
+        }
+
+        let source = url.standardizedFileURL
+        guard environment.fileExists(source) else {
+            return .failure(ZoneFileOperationError.missingItem(source))
+        }
+        guard source.deletingLastPathComponent() == directory else {
+            return .failure(ZoneFileOperationError.itemOutsideZone(source))
+        }
+        return .success(zone)
+    }
+
+    private func validatedZone(zoneID: UUID, requireDirectory: Bool) -> ZoneModel? {
+        guard let zone = environment.currentConfig().zones.first(where: { $0.id == zoneID }) else {
+            rejectStaleContext(
+                zoneID: zoneID,
+                error: ZoneFileOperationError.missingZone(zoneID)
+            )
+            return nil
+        }
+        if requireDirectory {
+            let directory = environment.directoryURL(zone).standardizedFileURL
+            guard environment.fileExists(directory) else {
+                rejectStaleContext(
+                    zoneID: zoneID,
+                    error: ZoneFileOperationError.missingDirectory(directory)
+                )
+                return nil
+            }
+        }
+        return zone
+    }
+
+    private func rejectStaleContext(zoneID: UUID, error: Error) {
+        _ = refresh(zoneID: zoneID)
+        environment.presentError("项目已发生变化", error.localizedDescription)
+    }
+
+    private func installCached(_ files: [ZoneStoredFile], for zone: ZoneModel) {
+        environment.installFiles(
+            zone,
+            ZoneStoredFileSorter.sorted(files, by: zone.fileSortOrder)
+        )
+    }
+
+    private func presentRefreshFallback(_ error: Error) {
+        environment.presentError(
+            "无法刷新分区",
+            "\(error.localizedDescription) 已用安全的缓存更新保持当前视图一致。"
+        )
+    }
+}
+
 @MainActor
 final class WindowManager {
     private var windows: [UUID: ZoneWindow] = [:]
@@ -1409,6 +1768,11 @@ final class WindowManager {
     var onTrashFile: ((UUID, URL) -> Void)?
     var onRefreshFiles: ((UUID) -> Void)?
     var onPresentFileError: ((String, String) -> Void)?
+    var onValidateFile: ((UUID, URL) -> Bool)?
+
+    var contextMenuControllerForTesting: ZoneFileContextMenuController {
+        fileContextMenuController
+    }
 
     init() {
         fileContextMenuController.onCreateFolder = { [weak self] zoneID in
@@ -1419,12 +1783,21 @@ final class WindowManager {
         }
         fileContextMenuController.onRename = { [weak self] context in
             guard let url = context.file?.url else {
+                self?.onRefreshFiles?(context.zoneID)
+                self?.onPresentFileError?("项目已发生变化", "重命名上下文已失效。")
                 return
             }
-            self?.windows[context.zoneID]?.beginRenamingFile(at: url)
+            guard let window = self?.windows[context.zoneID] else {
+                self?.onRefreshFiles?(context.zoneID)
+                self?.onPresentFileError?("项目已发生变化", "分区窗口已关闭。")
+                return
+            }
+            _ = window.beginRenamingFile(at: url)
         }
         fileContextMenuController.onTrash = { [weak self] context in
             guard let url = context.file?.url else {
+                self?.onRefreshFiles?(context.zoneID)
+                self?.onPresentFileError?("项目已发生变化", "废纸篓操作上下文已失效。")
                 return
             }
             self?.onTrashFile?(context.zoneID, url)
@@ -1434,6 +1807,9 @@ final class WindowManager {
         }
         fileContextMenuController.onPresentError = { [weak self] message, details in
             self?.onPresentFileError?(message, details)
+        }
+        fileContextMenuController.onValidateItem = { [weak self] zoneID, url in
+            self?.onValidateFile?(zoneID, url) ?? false
         }
     }
 
@@ -1460,6 +1836,9 @@ final class WindowManager {
             }
             window.onPresentFileError = { [weak self] details in
                 self?.onPresentFileError?("无法重新命名", details)
+            }
+            window.onRefreshFiles = { [weak self] zoneID in
+                self?.onRefreshFiles?(zoneID)
             }
             window.onSelect = { [weak self] zoneID in
                 self?.selectZone(id: zoneID)
@@ -1537,8 +1916,13 @@ final class WindowManager {
         )
     }
 
-    func selectAndRenameFile(at url: URL, in zoneID: UUID) {
-        windows[zoneID]?.beginRenamingFile(at: url)
+    func selectAndRenameFile(at url: URL, in zoneID: UUID) -> Bool {
+        guard let window = windows[zoneID] else {
+            onRefreshFiles?(zoneID)
+            onPresentFileError?("无法重新命名", "分区窗口已关闭。")
+            return false
+        }
+        return window.beginRenamingFile(at: url)
     }
 
     func selectedZone(in zones: [ZoneModel]) -> ZoneModel? {
@@ -1657,6 +2041,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var watcher: DesktopFileWatcher?
     private var lastSortDate = Date.distantPast
     private var isEditingZones = false
+    private lazy var fileOperationCoordinator = ZoneFileOperationCoordinator(
+        environment: ZoneFileOperationEnvironment(
+            currentConfig: { [unowned self] in config },
+            saveConfig: { [unowned self] in try configManager.save($0) },
+            applyConfig: { [unowned self] in config = $0 },
+            cachedFiles: { [unowned self] in filesByZoneID[$0] ?? [] },
+            installFiles: { [unowned self] zone, files in
+                installZoneFiles(files, for: zone)
+            },
+            scanFiles: { [unowned self] in try zoneLibrary.files(in: $0) },
+            directoryURL: { [unowned self] in zoneLibrary.directoryURL(for: $0) },
+            fileExists: { FileManager.default.fileExists(atPath: $0.path) },
+            createFolder: { [unowned self] in
+                try zoneLibrary.createFolder(in: $0, preferredName: "新建文件夹")
+            },
+            renameItem: { [unowned self] url, name, zone in
+                try zoneLibrary.renameStoredItem(at: url, to: name, in: zone)
+            },
+            trashItem: { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) },
+            beginRenaming: { [unowned self] url, zoneID in
+                windowManager.selectAndRenameFile(at: url, in: zoneID)
+            },
+            noteRefreshAttempt: { _ in },
+            presentError: { [unowned self] message, details in
+                showError(message: message, informativeText: details)
+            }
+        )
+    )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -1749,10 +2161,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.trashStoredFile(url, in: zoneID)
         }
         windowManager.onRefreshFiles = { [weak self] zoneID in
-            self?.refreshZoneFiles(zoneID: zoneID)
+            guard let self else { return }
+            if case let .failure(error) = self.refreshZoneFiles(zoneID: zoneID) {
+                self.showError(
+                    message: "无法刷新分区",
+                    informativeText: error.localizedDescription
+                )
+            }
         }
         windowManager.onPresentFileError = { [weak self] message, details in
             self?.showError(message: message, informativeText: details)
+        }
+        windowManager.onValidateFile = { [weak self] zoneID, url in
+            self?.fileOperationCoordinator.validateItem(zoneID: zoneID, url: url) ?? false
         }
     }
 
@@ -1799,29 +2220,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
-    private func refreshZoneFiles(zoneID: UUID) {
-        guard let zone = config.zones.first(where: { $0.id == zoneID }) else {
-            return
-        }
+    private func refreshZoneFiles(zoneID: UUID) -> Result<[ZoneStoredFile], Error> {
+        fileOperationCoordinator.refresh(zoneID: zoneID)
+    }
 
-        do {
-            let files = ZoneStoredFileSorter.sorted(
-                try zoneLibrary.files(in: zone),
-                by: zone.fileSortOrder
-            )
-            filesByZoneID[zone.id] = files
-            windowManager.updateFiles(
-                files,
-                for: zone,
-                fileLayout: currentFinderFileLayout()
-            )
-        } catch {
-            NSLog("ZoneDesk: failed to list files for zone \(zone.name): \(error)")
-            showError(
-                message: "无法刷新分区",
-                informativeText: error.localizedDescription
-            )
-        }
+    private func installZoneFiles(_ files: [ZoneStoredFile], for zone: ZoneModel) {
+        filesByZoneID[zone.id] = files
+        windowManager.updateFiles(
+            files,
+            for: zone,
+            fileLayout: currentFinderFileLayout()
+        )
     }
 
     private func currentFinderFileLayout() -> FinderDesktopIconLayout {
@@ -1842,46 +2251,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func createFolder(in zoneID: UUID) {
-        guard let zone = config.zones.first(where: { $0.id == zoneID }) else {
-            return
-        }
-
-        do {
-            let url = try zoneLibrary.createFolder(
-                in: zone,
-                preferredName: "新建文件夹"
-            )
-            refreshZoneFiles(zoneID: zoneID)
-            windowManager.selectAndRenameFile(at: url, in: zoneID)
-        } catch {
-            NSLog("ZoneDesk: failed to create folder in zone \(zone.name): \(error)")
-            showError(
-                message: "无法新建文件夹",
-                informativeText: error.localizedDescription
-            )
-        }
+        _ = fileOperationCoordinator.createFolder(in: zoneID)
     }
 
     private func changeFileSortOrder(_ order: ZoneFileSortOrder, in zoneID: UUID) {
-        guard let index = config.zones.firstIndex(where: { $0.id == zoneID }) else {
-            return
-        }
-
-        var updatedConfig = config!
-        updatedConfig.zones[index].fileSortOrder = order
-        do {
-            try configManager.save(updatedConfig)
-        } catch {
-            NSLog("ZoneDesk: failed to save file sort order for zone \(config.zones[index].name): \(error)")
-            showError(
-                message: "无法更改排序方式",
-                informativeText: "配置保存失败，已保留原排序。\n\(error.localizedDescription)"
-            )
-            return
-        }
-
-        config = updatedConfig
-        refreshZoneFiles(zoneID: zoneID)
+        _ = fileOperationCoordinator.changeSortOrder(order, in: zoneID)
     }
 
     private func renameStoredFile(
@@ -1889,39 +2263,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         to newName: String,
         in zoneID: UUID
     ) -> Result<URL, Error> {
-        guard let zone = config.zones.first(where: { $0.id == zoneID }) else {
-            return .failure(NSError(
-                domain: "ZoneDesk.ZoneFileRename",
-                code: 3,
-                userInfo: [NSLocalizedDescriptionKey: "找不到该项目所属的分区。"]
-            ))
-        }
-
-        do {
-            let renamedURL = try zoneLibrary.renameStoredItem(
-                at: url,
-                to: newName,
-                in: zone
-            )
-            refreshZoneFiles(zoneID: zoneID)
-            return .success(renamedURL)
-        } catch {
-            NSLog("ZoneDesk: failed to rename stored item \(url.path): \(error)")
-            return .failure(error)
-        }
+        fileOperationCoordinator.renameItem(url, to: newName, in: zoneID)
     }
 
     private func trashStoredFile(_ url: URL, in zoneID: UUID) {
-        do {
-            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
-            refreshZoneFiles(zoneID: zoneID)
-        } catch {
-            NSLog("ZoneDesk: failed to trash stored item \(url.path): \(error)")
-            showError(
-                message: "无法移到废纸篓",
-                informativeText: error.localizedDescription
-            )
-        }
+        _ = fileOperationCoordinator.trash(url, in: zoneID)
     }
 
     @objc private func collectDesktopFiles() {

@@ -1,4 +1,5 @@
 import AppKit
+import QuickLookUI
 import Testing
 @testable import ZoneDeskApp
 import ZoneDeskCore
@@ -6,6 +7,268 @@ import ZoneDeskCore
 @Suite("Zone file selection")
 @MainActor
 struct ZoneFilesViewSelectionTests {
+    @Test("sort save failure keeps config cache and window state unchanged")
+    func sortSaveFailureRollsBackEverything() {
+        let harness = ZoneFileOperationHarness()
+        harness.saveError = OperationHarnessError.expected
+        let initialConfig = harness.config
+        let initialFiles = harness.filesByZoneID
+
+        harness.coordinator.changeSortOrder(.size, in: harness.zone.id)
+
+        #expect(harness.config == initialConfig)
+        #expect(harness.filesByZoneID == initialFiles)
+        #expect(harness.installedZones.isEmpty)
+        #expect(harness.presentedErrors.count == 1)
+    }
+
+    @Test("sort save success immediately updates zone and cached order even when scan fails")
+    func sortSuccessDoesNotDependOnRescan() {
+        let harness = ZoneFileOperationHarness()
+        harness.scanError = OperationHarnessError.expected
+
+        harness.coordinator.changeSortOrder(.size, in: harness.zone.id)
+
+        #expect(harness.config.zones[0].fileSortOrder == .size)
+        #expect(harness.installedZones.last?.fileSortOrder == .size)
+        #expect(harness.filesByZoneID[harness.zone.id]?.map(\.displayName) == ["small", "large"])
+        #expect(harness.presentedErrors.count == 1)
+    }
+
+    @Test("create refreshes then renames and falls back to cached insertion on scan failure")
+    func createRefreshRenameSequence() {
+        let harness = ZoneFileOperationHarness()
+        harness.scanError = OperationHarnessError.expected
+
+        harness.coordinator.createFolder(in: harness.zone.id)
+
+        #expect(harness.events.prefix(2) == ["create", "refresh"])
+        #expect(harness.events.suffix(2) == ["install", "rename"])
+        #expect(harness.filesByZoneID[harness.zone.id]?.contains(where: { $0.url == harness.createdURL }) == true)
+        #expect(harness.presentedErrors.count == 1)
+    }
+
+    @Test("trash rejects sources outside the current zone and requests targeted refresh")
+    func trashValidatesCurrentZoneAndSource() {
+        let harness = ZoneFileOperationHarness()
+        let outsideURL = URL(fileURLWithPath: "/outside/file.pdf")
+        harness.existingPaths.insert(outsideURL.standardizedFileURL)
+
+        harness.coordinator.trash(outsideURL, in: harness.zone.id)
+
+        #expect(harness.trashedURLs.isEmpty)
+        #expect(harness.refreshAttempts == [harness.zone.id])
+        #expect(harness.presentedErrors.count == 1)
+    }
+
+    @Test("trash success removes stale cached item when refresh fails")
+    func trashRefreshFailureUsesCacheFallback() {
+        let harness = ZoneFileOperationHarness()
+        harness.scanError = OperationHarnessError.expected
+        let source = harness.filesByZoneID[harness.zone.id]![0].url
+
+        harness.coordinator.trash(source, in: harness.zone.id)
+
+        #expect(harness.trashedURLs == [source])
+        #expect(harness.filesByZoneID[harness.zone.id]?.contains(where: { $0.url == source }) == false)
+        #expect(harness.presentedErrors.count == 1)
+    }
+
+    @Test("stale zone and missing rename cell refresh and report instead of returning silently")
+    func staleContextsRefreshAndReport() throws {
+        let harness = ZoneFileOperationHarness()
+        let staleZoneID = UUID()
+
+        #expect(!harness.coordinator.validateItem(
+            zoneID: staleZoneID,
+            url: URL(fileURLWithPath: "/stale/file.pdf")
+        ))
+
+        let fixture = try ZoneFilesViewFixture(fileCount: 0)
+        var refreshCount = 0
+        var message: String?
+        fixture.view.onRefreshFiles = { _ in refreshCount += 1 }
+        fixture.view.onPresentError = { message = $0 }
+        #expect(!fixture.view.beginRenaming(url: URL(fileURLWithPath: "/missing.pdf")))
+        #expect(refreshCount == 1)
+        #expect(message != nil)
+        #expect(harness.refreshAttempts == [staleZoneID])
+    }
+
+    @Test("AppleScript path escaping handles quotes backslashes and line endings")
+    func appleScriptPathEscaping() {
+        let expression = ZoneFileContextMenuController.appleScriptStringExpression(
+            "a\\\"b\r\nc"
+        )
+
+        #expect(expression == "\"a\\\\\\\"b\" & return & \"\" & linefeed & \"c\"")
+    }
+
+    @Test("Quick Look responder owns and releases the preview data source")
+    func quickLookControlLifecycle() {
+        let view = ZoneFilesView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+        let panel = QLPreviewPanel.shared()!
+        view.prepareQuickLook(url: URL(fileURLWithPath: "/tmp/preview.pdf"))
+
+        #expect(view.acceptsPreviewPanelControl(panel))
+        view.beginPreviewPanelControl(panel)
+        #expect(panel.dataSource === view.quickLookDataSourceForTesting)
+
+        view.endPreviewPanelControl(panel)
+        #expect(panel.dataSource == nil)
+        #expect(view.quickLookDataSourceForTesting == nil)
+    }
+
+    @Test("WindowManager routes menu actions with the captured zone identifier")
+    func windowManagerRoutesCapturedZoneID() {
+        let manager = WindowManager()
+        let zoneID = UUID()
+        let url = URL(fileURLWithPath: "/library/Documents/file.pdf")
+        let file = ZoneStoredFile(url: url, displayName: "file.pdf", category: .document)
+        let anchor = NSView(frame: .zero)
+        var validatedZoneIDs: [UUID] = []
+        var trashedZoneIDs: [UUID] = []
+        manager.onValidateFile = { validatedZoneID, validatedURL in
+            validatedZoneIDs.append(validatedZoneID)
+            return validatedURL == url
+        }
+        manager.onTrashFile = { zoneID, _ in trashedZoneIDs.append(zoneID) }
+
+        let menu = manager.contextMenuControllerForTesting.menu(for: ZoneFileContext(
+            zoneID: zoneID,
+            file: file,
+            anchorView: anchor,
+            anchorRect: .zero,
+            fileSortOrder: .name
+        ))
+        if let trashItem = menu.items.first(where: { $0.title == "移到废纸篓" }) {
+            invoke(trashItem)
+        }
+
+        #expect(validatedZoneIDs == [zoneID, zoneID])
+        #expect(trashedZoneIDs == [zoneID])
+    }
+
+    @Test("rename scan failure replaces the cached source and still returns success")
+    func renameRefreshFailureUsesCacheFallback() {
+        let harness = ZoneFileOperationHarness()
+        harness.scanError = OperationHarnessError.expected
+        let source = harness.filesByZoneID[harness.zone.id]![0].url
+
+        let result = harness.coordinator.renameItem(source, to: "renamed", in: harness.zone.id)
+
+        guard case let .success(renamedURL) = result else {
+            Issue.record("rename should succeed after a cache fallback")
+            return
+        }
+        #expect(harness.filesByZoneID[harness.zone.id]?.contains(where: { $0.url == source }) == false)
+        #expect(harness.filesByZoneID[harness.zone.id]?.contains(where: { $0.url == renamedURL }) == true)
+        #expect(harness.presentedErrors.count == 1)
+    }
+
+    @Test("Open With and Share keep dynamic targets alive and dispatch injected services")
+    func dynamicSystemTargetsAreRetained() {
+        let controller = ZoneFileContextMenuController()
+        let applicationURL = URL(fileURLWithPath: "/Applications/Fake.app", isDirectory: true)
+        let fileURL = URL(fileURLWithPath: "/library/Documents/file.pdf")
+        var openedPair: [URL] = []
+        var shareCount = 0
+        let service = NSSharingService(
+            title: "Fake Share",
+            image: NSImage(size: NSSize(width: 1, height: 1)),
+            alternateImage: nil
+        ) {
+            shareCount += 1
+        }
+        controller.onValidateItem = { _, _ in true }
+        controller.applicationURLsProvider = { _ in [applicationURL] }
+        controller.defaultApplicationProvider = { _ in applicationURL }
+        controller.sharingServicesProvider = { _ in [service] }
+        controller.openWithApplication = { openedPair = [$0, $1] }
+
+        let menu = controller.menu(for: ZoneFileContext(
+            zoneID: UUID(),
+            file: ZoneStoredFile(url: fileURL, displayName: "file.pdf", category: .document),
+            anchorView: NSView(frame: .zero),
+            anchorRect: .zero,
+            fileSortOrder: .name
+        ))
+        let openItem = menu.items.first(where: { $0.title == "打开方式" })?.submenu?.items.first
+        let shareItem = menu.items.first(where: { $0.title == "共享" })?.submenu?.items.first
+        weak var openTarget = openItem?.target as AnyObject?
+        weak var shareTarget = shareItem?.target as AnyObject?
+
+        #expect(openTarget != nil)
+        #expect(shareTarget != nil)
+        if let openItem { invoke(openItem) }
+        if let shareItem { invoke(shareItem) }
+        #expect(openedPair == [fileURL, applicationURL])
+        #expect(shareCount == 1)
+    }
+
+    @Test("stale item is rejected before Open With and Share service discovery")
+    func staleItemStopsSystemServiceDiscovery() {
+        let controller = ZoneFileContextMenuController()
+        let zoneID = UUID()
+        let url = URL(fileURLWithPath: "/library/Documents/missing.pdf")
+        var validatedPair: (UUID, URL)?
+        var discoveryCount = 0
+        controller.onValidateItem = {
+            validatedPair = ($0, $1)
+            return false
+        }
+        controller.applicationURLsProvider = { _ in
+            discoveryCount += 1
+            return []
+        }
+        controller.sharingServicesProvider = { _ in
+            discoveryCount += 1
+            return []
+        }
+
+        _ = controller.menu(for: ZoneFileContext(
+            zoneID: zoneID,
+            file: ZoneStoredFile(url: url, displayName: "missing.pdf", category: .document),
+            anchorView: NSView(frame: .zero),
+            anchorRect: .zero,
+            fileSortOrder: .name
+        ))
+
+        #expect(validatedPair?.0 == zoneID)
+        #expect(validatedPair?.1 == url)
+        #expect(discoveryCount == 0)
+    }
+
+    @Test("failed Copy restores the previous pasteboard contents")
+    func copyFailureRestoresPasteboard() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("ZoneDesk.CopyFailure.\(UUID())"))
+        pasteboard.clearContents()
+        pasteboard.setString("keep me", forType: .string)
+        let controller = ZoneFileContextMenuController()
+        controller.onValidateItem = { _, _ in true }
+        controller.applicationURLsProvider = { _ in [] }
+        controller.sharingServicesProvider = { _ in [] }
+        controller.pasteboardProvider = { pasteboard }
+        controller.pasteboardURLWriter = { _, _ in false }
+
+        let menu = controller.menu(for: ZoneFileContext(
+            zoneID: UUID(),
+            file: ZoneStoredFile(
+                url: URL(fileURLWithPath: "/library/Documents/file.pdf"),
+                displayName: "file.pdf",
+                category: .document
+            ),
+            anchorView: NSView(frame: .zero),
+            anchorRect: .zero,
+            fileSortOrder: .name
+        ))
+        if let copyItem = menu.items.first(where: { $0.title == "复制" }) {
+            invoke(copyItem)
+        }
+
+        #expect(pasteboard.string(forType: .string) == "keep me")
+    }
+
     @Test("blank context menu clears selection and contains new folder and sorting")
     func blankContextMenu() throws {
         let fixture = try ZoneFilesViewFixture(fileCount: 1)
@@ -646,6 +909,92 @@ struct ZoneFilesViewSelectionTests {
         #expect(cell.height == CGFloat(layout.cellSize))
         #expect(regions.icon.width == CGFloat(layout.iconSize + 8))
         #expect(regions.icon.height == CGFloat(layout.iconSize + 8))
+    }
+}
+
+private enum OperationHarnessError: Error {
+    case expected
+}
+
+@MainActor
+private final class ZoneFileOperationHarness {
+    let zone = ZoneModel(
+        id: UUID(),
+        name: "Documents",
+        rect: ZoneRect(x: 0, y: 0, width: 300, height: 220),
+        acceptedCategories: [.document],
+        locked: false
+    )
+    let directoryURL = URL(fileURLWithPath: "/library/Documents", isDirectory: true)
+    let createdURL = URL(fileURLWithPath: "/library/Documents/New Folder", isDirectory: true)
+    var config: AppConfig
+    var filesByZoneID: [UUID: [ZoneStoredFile]]
+    var existingPaths: Set<URL>
+    var saveError: Error?
+    var scanError: Error?
+    var installedZones: [ZoneModel] = []
+    var trashedURLs: [URL] = []
+    var refreshAttempts: [UUID] = []
+    var presentedErrors: [(String, String)] = []
+    var events: [String] = []
+
+    lazy var coordinator = ZoneFileOperationCoordinator(environment: ZoneFileOperationEnvironment(
+        currentConfig: { [unowned self] in config },
+        saveConfig: { [unowned self] config in
+            if let saveError { throw saveError }
+        },
+        applyConfig: { [unowned self] in config = $0 },
+        cachedFiles: { [unowned self] in filesByZoneID[$0] ?? [] },
+        installFiles: { [unowned self] zone, files in
+            events.append("install")
+            installedZones.append(zone)
+            filesByZoneID[zone.id] = files
+        },
+        scanFiles: { [unowned self] _ in
+            events.append("refresh")
+            if let scanError { throw scanError }
+            return filesByZoneID[zone.id] ?? []
+        },
+        directoryURL: { [unowned self] _ in directoryURL },
+        fileExists: { [unowned self] in existingPaths.contains($0.standardizedFileURL) },
+        createFolder: { [unowned self] _ in
+            events.append("create")
+            existingPaths.insert(createdURL.standardizedFileURL)
+            return createdURL
+        },
+        renameItem: { source, name, _ in
+            source.deletingLastPathComponent().appendingPathComponent(name)
+        },
+        trashItem: { [unowned self] url in
+            trashedURLs.append(url)
+            existingPaths.remove(url.standardizedFileURL)
+        },
+        beginRenaming: { [unowned self] _, _ in
+            events.append("rename")
+            return true
+        },
+        noteRefreshAttempt: { [unowned self] in refreshAttempts.append($0) },
+        presentError: { [unowned self] in presentedErrors.append(($0, $1)) }
+    ))
+
+    init() {
+        config = AppConfig(zones: [zone])
+        let files = [
+            ZoneStoredFile(
+                url: directoryURL.appendingPathComponent("large"),
+                displayName: "large",
+                category: .document,
+                fileSize: 20
+            ),
+            ZoneStoredFile(
+                url: directoryURL.appendingPathComponent("small"),
+                displayName: "small",
+                category: .document,
+                fileSize: 10
+            ),
+        ]
+        filesByZoneID = [zone.id: files]
+        existingPaths = Set(([directoryURL] + files.map(\.url)).map(\.standardizedFileURL))
     }
 }
 

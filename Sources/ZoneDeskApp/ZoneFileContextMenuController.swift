@@ -32,7 +32,7 @@ private final class ZoneMenuActionTarget: NSObject {
     }
 }
 
-private final class ZoneRetainingMenu: NSMenu {
+final class ZoneRetainingMenu: NSMenu {
     private var retainedTargets: [NSObject] = []
 
     func retainTarget(_ target: NSObject) {
@@ -40,7 +40,7 @@ private final class ZoneRetainingMenu: NSMenu {
     }
 }
 
-private final class ZoneQuickLookDataSource: NSObject, QLPreviewPanelDataSource {
+final class ZoneQuickLookDataSource: NSObject, QLPreviewPanelDataSource {
     let url: NSURL
 
     init(url: URL) {
@@ -64,8 +64,21 @@ final class ZoneFileContextMenuController: NSObject {
     var onTrash: ((ZoneFileContext) -> Void)?
     var onRefresh: ((UUID) -> Void)?
     var onPresentError: ((String, String) -> Void)?
-
-    private var quickLookDataSource: ZoneQuickLookDataSource?
+    var onValidateItem: ((UUID, URL) -> Bool)?
+    var applicationURLsProvider: (URL) -> [URL] = {
+        NSWorkspace.shared.urlsForApplications(toOpen: $0)
+    }
+    var defaultApplicationProvider: (URL) -> URL? = {
+        NSWorkspace.shared.urlForApplication(toOpen: $0)
+    }
+    var sharingServicesProvider: (URL) -> [NSSharingService] = {
+        NSSharingService.sharingServices(forItems: [$0])
+    }
+    var openWithApplication: ((URL, URL) -> Void)?
+    var pasteboardProvider: () -> NSPasteboard = { .general }
+    var pasteboardURLWriter: (NSPasteboard, URL) -> Bool = { pasteboard, url in
+        pasteboard.writeObjects([url as NSURL])
+    }
 
     func menu(for context: ZoneFileContext) -> NSMenu {
         guard context.file != nil else {
@@ -87,6 +100,8 @@ final class ZoneFileContextMenuController: NSObject {
             let payload = ZoneMenuPayload(order)
             let item = actionItem(title: title, representedObject: payload, in: sortMenu) { [weak self] sender in
                 guard let order = (sender.representedObject as? ZoneMenuPayload<ZoneFileSortOrder>)?.value else {
+                    self?.onRefresh?(context.zoneID)
+                    self?.onPresentError?("无法更改排序方式", "排序选项已失效，已请求刷新分区。")
                     return
                 }
                 self?.onChangeSortOrder?(context.zoneID, order)
@@ -102,41 +117,54 @@ final class ZoneFileContextMenuController: NSObject {
     private func itemMenu(for context: ZoneFileContext) -> NSMenu {
         let menu = ZoneRetainingMenu()
         let file = context.file!
+        let systemServicesAvailable = validate(context)
 
         menu.addItem(actionItem(title: "打开", in: menu) { [weak self] _ in
+            guard self?.validate(context) == true else { return }
             self?.open(file.url, in: context.zoneID)
         })
 
         let openWithItem = NSMenuItem(title: "打开方式", action: nil, keyEquivalent: "")
-        openWithItem.submenu = openWithMenu(for: context)
+        openWithItem.submenu = systemServicesAvailable
+            ? openWithMenu(for: context)
+            : ZoneRetainingMenu(title: "打开方式")
+        openWithItem.isEnabled = systemServicesAvailable
         menu.addItem(openWithItem)
         menu.addItem(.separator())
 
         menu.addItem(actionItem(title: "移到废纸篓", in: menu) { [weak self] _ in
+            guard self?.validate(context) == true else { return }
             self?.onTrash?(context)
         })
         menu.addItem(.separator())
 
         menu.addItem(actionItem(title: "显示简介", in: menu) { [weak self] _ in
+            guard self?.validate(context) == true else { return }
             self?.showInfo(for: file.url)
         })
         menu.addItem(actionItem(title: "重新命名", in: menu) { [weak self] _ in
+            guard self?.validate(context) == true else { return }
             self?.onRename?(context)
         })
         menu.addItem(actionItem(title: "复制", in: menu) { [weak self] _ in
+            guard self?.validate(context) == true else { return }
             self?.copy(file.url)
         })
         menu.addItem(actionItem(title: "快速查看", in: menu) { [weak self] _ in
+            guard self?.validate(context) == true else { return }
             self?.quickLook(file.url, anchorView: context.anchorView)
         })
 
         let shareItem = NSMenuItem(title: "共享", action: nil, keyEquivalent: "")
-        shareItem.submenu = sharingMenu(for: file.url)
+        shareItem.submenu = systemServicesAvailable
+            ? sharingMenu(for: context)
+            : ZoneRetainingMenu(title: "共享")
         shareItem.isEnabled = shareItem.submenu?.items.isEmpty == false
         menu.addItem(shareItem)
         menu.addItem(.separator())
 
-        menu.addItem(actionItem(title: "在 Finder 中显示", in: menu) { _ in
+        menu.addItem(actionItem(title: "在 Finder 中显示", in: menu) { [weak self] _ in
+            guard self?.validate(context) == true else { return }
             NSWorkspace.shared.activateFileViewerSelecting([file.url])
         })
         return menu
@@ -148,9 +176,8 @@ final class ZoneFileContextMenuController: NSObject {
             return menu
         }
 
-        let workspace = NSWorkspace.shared
-        let defaultApplication = workspace.urlForApplication(toOpen: file.url)?.standardizedFileURL
-        let applications = workspace.urlsForApplications(toOpen: file.url)
+        let defaultApplication = defaultApplicationProvider(file.url)?.standardizedFileURL
+        let applications = applicationURLsProvider(file.url)
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
 
         for applicationURL in applications {
@@ -160,8 +187,11 @@ final class ZoneFileContextMenuController: NSObject {
             let payload = ZoneMenuPayload(applicationURL)
             menu.addItem(actionItem(title: title, representedObject: payload, in: menu) { [weak self] sender in
                 guard let applicationURL = (sender.representedObject as? ZoneMenuPayload<URL>)?.value else {
+                    self?.onRefresh?(context.zoneID)
+                    self?.onPresentError?("无法打开项目", "打开方式已失效，已请求刷新分区。")
                     return
                 }
+                guard self?.validate(context) == true else { return }
                 self?.open(file.url, with: applicationURL)
             })
         }
@@ -170,15 +200,22 @@ final class ZoneFileContextMenuController: NSObject {
             menu.addItem(.separator())
         }
         menu.addItem(actionItem(title: "其他…", in: menu) { [weak self] _ in
-            self?.chooseApplication(toOpen: file.url, anchorWindow: context.anchorView.window)
+            guard self?.validate(context) == true else { return }
+            self?.chooseApplication(for: context)
         })
         return menu
     }
 
-    private func sharingMenu(for url: URL) -> NSMenu {
+    private func sharingMenu(for context: ZoneFileContext) -> NSMenu {
         let menu = ZoneRetainingMenu(title: "共享")
-        for service in NSSharingService.sharingServices(forItems: [url]) {
-            menu.addItem(actionItem(title: service.title, in: menu) { _ in
+        guard let url = context.file?.url else {
+            onRefresh?(context.zoneID)
+            onPresentError?("无法共享项目", "项目上下文已失效。")
+            return menu
+        }
+        for service in sharingServicesProvider(url) {
+            menu.addItem(actionItem(title: service.title, in: menu) { [weak self] _ in
+                guard self?.validate(context) == true else { return }
                 service.perform(withItems: [url])
             })
         }
@@ -216,6 +253,10 @@ final class ZoneFileContextMenuController: NSObject {
     }
 
     private func open(_ url: URL, with applicationURL: URL) {
+        if let openWithApplication {
+            openWithApplication(url, applicationURL)
+            return
+        }
         let configuration = NSWorkspace.OpenConfiguration()
         NSWorkspace.shared.open(
             [url],
@@ -231,7 +272,12 @@ final class ZoneFileContextMenuController: NSObject {
         }
     }
 
-    private func chooseApplication(toOpen url: URL, anchorWindow: NSWindow?) {
+    private func chooseApplication(for context: ZoneFileContext) {
+        guard let url = context.file?.url else {
+            onRefresh?(context.zoneID)
+            onPresentError?("无法打开项目", "项目上下文已失效。")
+            return
+        }
         let panel = NSOpenPanel()
         panel.title = "选择应用程序"
         panel.prompt = "打开"
@@ -245,9 +291,10 @@ final class ZoneFileContextMenuController: NSObject {
             guard response == .OK, let applicationURL = panel.url else {
                 return
             }
+            guard self?.validate(context) == true else { return }
             self?.open(url, with: applicationURL)
         }
-        if let anchorWindow {
+        if let anchorWindow = context.anchorView.window {
             panel.beginSheetModal(for: anchorWindow, completionHandler: completion)
         } else {
             panel.begin(completionHandler: completion)
@@ -255,23 +302,22 @@ final class ZoneFileContextMenuController: NSObject {
     }
 
     private func copy(_ url: URL) {
-        let pasteboard = NSPasteboard.general
+        let pasteboard = pasteboardProvider()
+        let snapshot = ZonePasteboardSnapshot(pasteboard: pasteboard)
         pasteboard.clearContents()
-        guard pasteboard.writeObjects([url as NSURL]) else {
+        guard pasteboardURLWriter(pasteboard, url) else {
+            snapshot.restore(to: pasteboard)
             onPresentError?("无法复制项目", "无法将该项目写入剪贴板。")
             return
         }
     }
 
     private func quickLook(_ url: URL, anchorView: NSView) {
-        let dataSource = ZoneQuickLookDataSource(url: url)
-        quickLookDataSource = dataSource
-        let panel = QLPreviewPanel.shared()!
-        panel.dataSource = dataSource
-        panel.currentPreviewItemIndex = 0
-        panel.reloadData()
-        anchorView.window?.makeKey()
-        panel.makeKeyAndOrderFront(nil)
+        guard let filesView = anchorView as? ZoneFilesView else {
+            onPresentError?("无法快速查看", "分区视图已关闭。")
+            return
+        }
+        filesView.presentQuickLook(url: url)
     }
 
     private func showInfo(for url: URL) {
@@ -293,24 +339,31 @@ final class ZoneFileContextMenuController: NSObject {
         }
     }
 
-    private static func appleScriptStringExpression(_ value: String) -> String {
-        let parts = value.split(omittingEmptySubsequences: false) { character in
-            character == "\n" || character == "\r"
-        }
+    static func appleScriptStringExpression(_ value: String) -> String {
         var result: [String] = []
-        var index = value.startIndex
-        for part in parts {
-            let escaped = part
+        var current = String.UnicodeScalarView()
+
+        func appendCurrentString() {
+            let escaped = String(current)
                 .replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"")
             result.append("\"\(escaped)\"")
-            index = value.index(index, offsetBy: part.count)
-            guard index < value.endIndex else {
-                continue
-            }
-            result.append(value[index] == "\r" ? "return" : "linefeed")
-            index = value.index(after: index)
+            current.removeAll(keepingCapacity: true)
         }
+
+        for scalar in value.unicodeScalars {
+            switch scalar.value {
+            case 13:
+                appendCurrentString()
+                result.append("return")
+            case 10:
+                appendCurrentString()
+                result.append("linefeed")
+            default:
+                current.append(scalar)
+            }
+        }
+        appendCurrentString()
         return result.joined(separator: " & ")
     }
 
@@ -324,4 +377,39 @@ final class ZoneFileContextMenuController: NSObject {
         (.size, "大小"),
         (.tags, "标签"),
     ]
+
+    private func validate(_ context: ZoneFileContext) -> Bool {
+        guard let url = context.file?.url else {
+            onRefresh?(context.zoneID)
+            onPresentError?("项目已发生变化", "项目上下文已失效。")
+            return false
+        }
+        return onValidateItem?(context.zoneID, url) ?? true
+    }
+}
+
+private struct ZonePasteboardSnapshot {
+    private let items: [[NSPasteboard.PasteboardType: Data]]
+
+    init(pasteboard: NSPasteboard) {
+        items = (pasteboard.pasteboardItems ?? []).map { item in
+            Dictionary(uniqueKeysWithValues: item.types.compactMap { type in
+                item.data(forType: type).map { (type, $0) }
+            })
+        }
+    }
+
+    func restore(to pasteboard: NSPasteboard) {
+        pasteboard.clearContents()
+        let restoredItems = items.map { values -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, data) in values {
+                item.setData(data, forType: type)
+            }
+            return item
+        }
+        if !restoredItems.isEmpty {
+            pasteboard.writeObjects(restoredItems)
+        }
+    }
 }
