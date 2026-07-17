@@ -315,6 +315,17 @@ final class TransparentScroller: NSScroller {
 }
 
 final class ZoneScrollView: NSScrollView {
+    var showsZoneScroller = false {
+        didSet {
+            applyZoneScrollerVisibility()
+        }
+    }
+
+    override func tile() {
+        super.tile()
+        applyZoneScrollerVisibility()
+    }
+
     override func layout() {
         super.layout()
         guard let scroller = verticalScroller else {
@@ -322,6 +333,7 @@ final class ZoneScrollView: NSScrollView {
         }
 
         addSubview(scroller, positioned: .above, relativeTo: contentView)
+        applyZoneScrollerVisibility()
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -349,6 +361,10 @@ final class ZoneScrollView: NSScrollView {
         ZoneMouseLog.logScrollView(self, label: "ZoneScrollView.scrollWheel.before")
         super.scrollWheel(with: event)
         ZoneMouseLog.logScrollView(self, label: "ZoneScrollView.scrollWheel.after")
+    }
+
+    private func applyZoneScrollerVisibility() {
+        verticalScroller?.isHidden = !showsZoneScroller
     }
 }
 
@@ -592,6 +608,8 @@ final class ZoneView: NSView {
     private var dragMode: DragMode?
     private var initialMouseLocation = NSPoint.zero
     private var initialWindowFrame = NSRect.zero
+    private var zoneTrackingArea: NSTrackingArea?
+    private var isPointerInside = false
 
     private let titleHeight: CGFloat = 26
     private let resizeHandleSize: CGFloat = 24
@@ -615,8 +633,9 @@ final class ZoneView: NSView {
         filesScrollView.scrollerStyle = .overlay
         filesScrollView.hasVerticalScroller = true
         filesScrollView.hasHorizontalScroller = false
-        filesScrollView.autohidesScrollers = true
+        filesScrollView.autohidesScrollers = false
         filesScrollView.verticalScroller = TransparentScroller()
+        filesScrollView.verticalScroller?.isHidden = true
         filesScrollView.borderType = .noBorder
         filesScrollView.documentView = filesView
         addSubview(filesScrollView)
@@ -632,6 +651,7 @@ final class ZoneView: NSView {
         self.isEditing = isEditing
         self.isSelected = isSelected
         filesScrollView.isHidden = isEditing
+        updateScrollerVisibility()
         needsDisplay = true
     }
 
@@ -640,6 +660,7 @@ final class ZoneView: NSView {
         layout: FinderDesktopIconLayout = .finderDefault
     ) {
         filesView.setFiles(files, layout: layout)
+        updateScrollerVisibility()
     }
 
     var filesScrollViewForLogging: NSScrollView {
@@ -671,6 +692,34 @@ final class ZoneView: NSView {
         )
         filesView.needsLayout = true
         filesScrollView.reflectScrolledClipView(filesScrollView.contentView)
+        updateScrollerVisibility()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        if let zoneTrackingArea {
+            removeTrackingArea(zoneTrackingArea)
+        }
+
+        let trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        zoneTrackingArea = trackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isPointerInside = true
+        updateScrollerVisibility()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isPointerInside = false
+        updateScrollerVisibility()
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -739,6 +788,11 @@ final class ZoneView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
+    }
+
+    private func updateScrollerVisibility() {
+        let contentOverflows = filesView.frame.height > filesScrollView.contentSize.height + 0.5
+        filesScrollView.showsZoneScroller = isPointerInside && !isEditing && contentOverflows
     }
 
     override func mouseDragged(with event: NSEvent) {

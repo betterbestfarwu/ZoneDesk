@@ -119,6 +119,36 @@ struct ZoneViewScrollingTests {
         #expect(manager.currentFileLayout == layout)
     }
 
+    @Test("shows an overflowing scroller only while the pointer is inside the zone")
+    func scrollerFollowsZoneHover() throws {
+        let fixture = try ZoneScrollerHoverFixture(fileCount: 20)
+
+        #expect(fixture.scroller.isHidden)
+        fixture.view.mouseEntered(with: fixture.event)
+        #expect(!fixture.scroller.isHidden)
+        fixture.view.mouseExited(with: fixture.event)
+        #expect(fixture.scroller.isHidden)
+    }
+
+    @Test("keeps a non-overflowing scroller hidden on hover")
+    func nonOverflowingScrollerStaysHidden() throws {
+        let fixture = try ZoneScrollerHoverFixture(fileCount: 1, height: 300)
+
+        fixture.view.mouseEntered(with: fixture.event)
+
+        #expect(fixture.scroller.isHidden)
+    }
+
+    @Test("keeps the scroller hidden while editing zones")
+    func editingZoneKeepsScrollerHidden() throws {
+        let fixture = try ZoneScrollerHoverFixture(fileCount: 20)
+        fixture.view.update(zone: fixture.zone, isEditing: true, isSelected: false)
+
+        fixture.view.mouseEntered(with: fixture.event)
+
+        #expect(fixture.scroller.isHidden)
+    }
+
     @Test("enables vertical scrolling for overflowing zone files")
     func enablesVerticalScrollingForOverflowingZoneFiles() throws {
         let view = ZoneView(
@@ -699,5 +729,54 @@ struct ZoneViewScrollingTests {
         scroller.mouseDragged(with: dragEvent)
 
         #expect(scrollView.contentView.bounds.origin.y > 0)
+    }
+}
+
+@MainActor
+private final class ZoneScrollerHoverFixture {
+    let zone: ZoneModel
+    let view: ZoneView
+    let window: NSWindow
+    let scroller: NSScroller
+    let event: NSEvent
+
+    init(fileCount: Int, height: CGFloat = 160) throws {
+        zone = ZoneModel(
+            name: "文档",
+            rect: ZoneRect(x: 0, y: 0, width: 300, height: height),
+            acceptedCategories: [.document],
+            locked: false
+        )
+        view = ZoneView(zone: zone)
+        view.frame = NSRect(x: 0, y: 0, width: 300, height: height)
+        window = NSWindow(
+            contentRect: view.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = view
+        view.setFiles((0..<fileCount).map { index in
+            ZoneStoredFile(
+                url: URL(fileURLWithPath: "/tmp/file-\(index).pdf"),
+                displayName: "file-\(index).pdf",
+                category: .document
+            )
+        })
+        view.layoutSubtreeIfNeeded()
+
+        let scrollView = try #require(view.subviews.compactMap { $0 as? NSScrollView }.first)
+        scroller = try #require(scrollView.verticalScroller)
+        event = try #require(NSEvent.mouseEvent(
+            with: .mouseMoved,
+            location: NSPoint(x: view.bounds.midX, y: view.bounds.midY),
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 0,
+            pressure: 0
+        ))
     }
 }
