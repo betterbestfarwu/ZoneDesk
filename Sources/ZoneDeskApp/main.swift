@@ -179,13 +179,19 @@ final class ZoneWindow: NSWindow {
         }
     }
 
-    func update(zone: ZoneModel, isEditing: Bool, isSelected: Bool, files: [ZoneStoredFile]) {
+    func update(
+        zone: ZoneModel,
+        isEditing: Bool,
+        isSelected: Bool,
+        files: [ZoneStoredFile],
+        fileLayout: FinderDesktopIconLayout = .finderDefault
+    ) {
         self.zone = zone
         level = isEditing ? .floating : Self.desktopOverlayLevel
         ignoresMouseEvents = false
         setFrame(zone.rect.nsRect, display: true)
         zoneView.update(zone: zone, isEditing: isEditing, isSelected: isSelected)
-        zoneView.setFiles(files)
+        zoneView.setFiles(files, layout: fileLayout)
         if isEditing {
             orderFrontRegardless()
         }
@@ -358,6 +364,10 @@ final class ZoneFilesView: NSView {
     private var cells: [Cell] = []
     private var fileLayout = FinderDesktopIconLayout.finderDefault
     private(set) var selectedFileURL: URL?
+
+    var currentFileLayout: FinderDesktopIconLayout {
+        fileLayout
+    }
 
     var onOpenFile: ((URL) -> Void)?
 
@@ -623,8 +633,11 @@ final class ZoneView: NSView {
         needsDisplay = true
     }
 
-    func setFiles(_ files: [ZoneStoredFile]) {
-        filesView.setFiles(files)
+    func setFiles(
+        _ files: [ZoneStoredFile],
+        layout: FinderDesktopIconLayout = .finderDefault
+    ) {
+        filesView.setFiles(files, layout: layout)
     }
 
     var filesScrollViewForLogging: NSScrollView {
@@ -821,6 +834,7 @@ final class WindowManager {
     private var filesByZoneID: [UUID: [ZoneStoredFile]] = [:]
     private var isEditing = false
     private var selectedZoneID: UUID?
+    private(set) var currentFileLayout = FinderDesktopIconLayout.finderDefault
 
     var onZoneChanged: ((ZoneModel) -> Void)?
     var onRenameRequested: ((UUID) -> Void)?
@@ -849,7 +863,8 @@ final class WindowManager {
                 zone: zone,
                 isEditing: isEditing,
                 isSelected: zone.id == selectedZoneID,
-                files: filesByZoneID[zone.id] ?? []
+                files: filesByZoneID[zone.id] ?? [],
+                fileLayout: currentFileLayout
             )
             window.orderFrontRegardless()
         }
@@ -869,18 +884,24 @@ final class WindowManager {
             zone: zone,
             isEditing: isEditing,
             isSelected: zone.id == selectedZoneID,
-            files: filesByZoneID[zone.id] ?? []
+            files: filesByZoneID[zone.id] ?? [],
+            fileLayout: currentFileLayout
         )
     }
 
-    func updateFiles(_ filesByZoneID: [UUID: [ZoneStoredFile]]) {
+    func updateFiles(
+        _ filesByZoneID: [UUID: [ZoneStoredFile]],
+        fileLayout: FinderDesktopIconLayout
+    ) {
         self.filesByZoneID = filesByZoneID
+        currentFileLayout = fileLayout
         for (zoneID, window) in windows {
             window.update(
                 zone: window.zone,
                 isEditing: isEditing,
                 isSelected: zoneID == selectedZoneID,
-                files: filesByZoneID[zoneID] ?? []
+                files: filesByZoneID[zoneID] ?? [],
+                fileLayout: currentFileLayout
             )
         }
     }
@@ -907,7 +928,8 @@ final class WindowManager {
                 zone: window.zone,
                 isEditing: isEditing,
                 isSelected: zoneID == selectedZoneID,
-                files: filesByZoneID[zoneID] ?? []
+                files: filesByZoneID[zoneID] ?? [],
+                fileLayout: currentFileLayout
             )
         }
         onSelectionChanged?()
@@ -1110,7 +1132,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         filesByZoneID = refreshed
-        windowManager.updateFiles(refreshed)
+        windowManager.updateFiles(
+            refreshed,
+            fileLayout: currentFinderFileLayout()
+        )
+    }
+
+    private func currentFinderFileLayout() -> FinderDesktopIconLayout {
+        guard let settings = finderDefaults?.dictionary(forKey: "DesktopViewSettings") else {
+            return .finderDefault
+        }
+        return FinderDesktopSettings.iconLayout(from: settings)
     }
 
     private func openStoredFile(_ url: URL) {

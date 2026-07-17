@@ -76,6 +76,49 @@ struct ZoneViewScrollingTests {
         #expect(window.level < .normal)
     }
 
+    @Test("window update applies the current Finder file layout")
+    func windowUpdateAppliesFinderFileLayout() throws {
+        let window = ZoneWindow(
+            zone: ZoneModel(
+                name: "文档",
+                rect: ZoneRect(x: 0, y: 0, width: 320, height: 240),
+                acceptedCategories: [.document],
+                locked: false
+            )
+        )
+        let layout = FinderDesktopIconLayout(iconSize: 80, gridSpacing: 60, textSize: 14)
+
+        window.update(
+            zone: window.zone,
+            isEditing: false,
+            isSelected: false,
+            files: [
+                ZoneStoredFile(
+                    url: URL(fileURLWithPath: "/tmp/report.pdf"),
+                    displayName: "report.pdf",
+                    category: .document
+                ),
+            ],
+            fileLayout: layout
+        )
+        window.layoutIfNeeded()
+
+        let zoneView = try #require(window.contentView as? ZoneView)
+        let scrollView = try #require(zoneView.subviews.compactMap { $0 as? NSScrollView }.first)
+        let filesView = try #require(scrollView.documentView as? ZoneFilesView)
+        #expect(filesView.currentFileLayout == layout)
+    }
+
+    @Test("window manager retains refreshed Finder layout")
+    func windowManagerRetainsRefreshedFinderLayout() {
+        let manager = WindowManager()
+        let layout = FinderDesktopIconLayout(iconSize: 72, gridSpacing: 50, textSize: 13)
+
+        manager.updateFiles([:], fileLayout: layout)
+
+        #expect(manager.currentFileLayout == layout)
+    }
+
     @Test("enables vertical scrolling for overflowing zone files")
     func enablesVerticalScrollingForOverflowingZoneFiles() throws {
         let view = ZoneView(
