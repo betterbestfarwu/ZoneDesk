@@ -200,6 +200,20 @@ public enum ZoneStoredItemNameValidator {
     }
 }
 
+private enum ZoneCaseOnlyRenameRollbackError: LocalizedError {
+    case temporaryItemMissing(URL)
+    case originalPathOccupied(URL)
+
+    var errorDescription: String? {
+        switch self {
+        case let .temporaryItemMissing(url):
+            return "Cannot restore case-only rename because the temporary item is missing: \(url.path)"
+        case let .originalPathOccupied(url):
+            return "Cannot restore case-only rename because the original path is occupied: \(url.path)"
+        }
+    }
+}
+
 public struct ZoneLibrary {
     public var rootURL: URL
     public var fileManager: FileManager
@@ -590,9 +604,11 @@ public struct ZoneLibrary {
     }
 
     private func restoreRenameItem(from temporaryURL: URL, to source: URL) throws {
-        guard fileManager.fileExists(atPath: temporaryURL.path),
-              !fileManager.fileExists(atPath: source.path) else {
-            return
+        guard fileManager.fileExists(atPath: temporaryURL.path) else {
+            throw ZoneCaseOnlyRenameRollbackError.temporaryItemMissing(temporaryURL)
+        }
+        guard !fileManager.fileExists(atPath: source.path) else {
+            throw ZoneCaseOnlyRenameRollbackError.originalPathOccupied(source)
         }
         try renameMoveItem(temporaryURL, source)
     }

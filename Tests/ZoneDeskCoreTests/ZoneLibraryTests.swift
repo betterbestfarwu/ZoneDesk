@@ -129,6 +129,119 @@ struct ZoneLibraryTests {
         #expect(!FileManager.default.fileExists(atPath: destination.path))
     }
 
+    @Test("case-only rename reports a missing temporary item during rollback")
+    func caseOnlyRenameReportsMissingTemporaryDuringRollback() throws {
+        let fixture = try TemporaryZoneLibraryFixture()
+        defer { fixture.cleanUp() }
+        let zone = fixture.zone(name: "资料", categories: [.other])
+        let source = try fixture.writeZoneFile(named: "draft.txt", contents: "original", in: zone)
+        let destination = source.deletingLastPathComponent().appendingPathComponent("Draft.txt")
+        var moves: [(URL, URL)] = []
+        let library = ZoneLibrary(
+            rootURL: fixture.rootURL,
+            volumeSupportsCaseSensitiveNames: { _ in false },
+            renameMoveItem: { from, to in
+                moves.append((from, to))
+                switch moves.count {
+                case 1:
+                    try FileManager.default.moveItem(at: from, to: to)
+                case 2:
+                    try FileManager.default.removeItem(at: from)
+                    throw RenameMoveTestError.destinationMove
+                default:
+                    Issue.record("Unexpected rollback move")
+                }
+            }
+        )
+
+        do {
+            _ = try library.renameStoredItem(at: source, to: "Draft.txt", in: zone)
+            Issue.record("Expected rename and rollback validation to fail")
+        } catch let error as ZoneLibraryError {
+            guard case let .caseOnlyRenameRollbackFailed(
+                original,
+                temporary,
+                failedDestination,
+                renameFailure,
+                rollbackFailure
+            ) = error else {
+                Issue.record("Unexpected ZoneLibraryError: \(error)")
+                return
+            }
+            #expect(original == source.standardizedFileURL)
+            #expect(temporary == moves[0].1)
+            #expect(failedDestination == destination)
+            #expect(renameFailure == "Destination move failed.")
+            #expect(
+                rollbackFailure
+                    == "Cannot restore case-only rename because the temporary item is missing: \(temporary.path)"
+            )
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+
+        #expect(moves.count == 2)
+        #expect(!FileManager.default.fileExists(atPath: source.path))
+        #expect(!FileManager.default.fileExists(atPath: moves[0].1.path))
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
+    }
+
+    @Test("case-only rename reports an occupied original path during rollback")
+    func caseOnlyRenameReportsOccupiedOriginalDuringRollback() throws {
+        let fixture = try TemporaryZoneLibraryFixture()
+        defer { fixture.cleanUp() }
+        let zone = fixture.zone(name: "资料", categories: [.other])
+        let source = try fixture.writeZoneFile(named: "draft.txt", contents: "original", in: zone)
+        let destination = source.deletingLastPathComponent().appendingPathComponent("Draft.txt")
+        var moves: [(URL, URL)] = []
+        let library = ZoneLibrary(
+            rootURL: fixture.rootURL,
+            volumeSupportsCaseSensitiveNames: { _ in false },
+            renameMoveItem: { from, to in
+                moves.append((from, to))
+                switch moves.count {
+                case 1:
+                    try FileManager.default.moveItem(at: from, to: to)
+                case 2:
+                    try Data("occupying item".utf8).write(to: source)
+                    throw RenameMoveTestError.destinationMove
+                default:
+                    Issue.record("Unexpected rollback move")
+                }
+            }
+        )
+
+        do {
+            _ = try library.renameStoredItem(at: source, to: "Draft.txt", in: zone)
+            Issue.record("Expected rename and rollback validation to fail")
+        } catch let error as ZoneLibraryError {
+            guard case let .caseOnlyRenameRollbackFailed(
+                original,
+                temporary,
+                failedDestination,
+                renameFailure,
+                rollbackFailure
+            ) = error else {
+                Issue.record("Unexpected ZoneLibraryError: \(error)")
+                return
+            }
+            #expect(original == source.standardizedFileURL)
+            #expect(temporary == moves[0].1)
+            #expect(failedDestination == destination)
+            #expect(renameFailure == "Destination move failed.")
+            #expect(
+                rollbackFailure
+                    == "Cannot restore case-only rename because the original path is occupied: \(source.path)"
+            )
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+
+        #expect(moves.count == 2)
+        #expect(try String(contentsOf: source) == "occupying item")
+        #expect(FileManager.default.fileExists(atPath: moves[0].1.path))
+    }
+
     @Test("rejects invalid folder names without escaping the zone")
     func rejectsInvalidFolderNames() throws {
         let fixture = try TemporaryZoneLibraryFixture()
