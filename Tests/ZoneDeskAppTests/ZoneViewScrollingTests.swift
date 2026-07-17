@@ -376,7 +376,9 @@ struct ZoneViewScrollingTests {
         window.layoutIfNeeded()
         window.orderFrontRegardless()
 
-        let scrollView = try #require((window.contentView as? ZoneView)?.subviews.compactMap { $0 as? NSScrollView }.first)
+        let view = try #require(window.contentView as? ZoneView)
+        try enterZone(view, in: window)
+        let scrollView = try #require(view.subviews.compactMap { $0 as? NSScrollView }.first)
         let scroller = try #require(scrollView.verticalScroller)
         let initialOriginY = scrollView.contentView.bounds.origin.y
         let scrollerPoint = NSPoint(x: scroller.bounds.midX, y: scroller.bounds.maxY - 4)
@@ -426,6 +428,7 @@ struct ZoneViewScrollingTests {
         window.makeKey()
 
         let view = try #require(window.contentView as? ZoneView)
+        try enterZone(view, in: window)
         let scrollView = try #require(view.subviews.compactMap { $0 as? NSScrollView }.first)
         let scroller = try #require(scrollView.verticalScroller)
         let initialOriginY = scrollView.contentView.bounds.origin.y
@@ -508,6 +511,7 @@ struct ZoneViewScrollingTests {
             )
         })
         view.layoutSubtreeIfNeeded()
+        try enterZone(view, in: window)
 
         let scrollView = try #require(view.subviews.compactMap { $0 as? NSScrollView }.first)
         let scroller = try #require(scrollView.verticalScroller)
@@ -544,6 +548,7 @@ struct ZoneViewScrollingTests {
             )
         })
         view.layoutSubtreeIfNeeded()
+        try enterZone(view, in: window)
 
         let scrollView = try #require(view.subviews.compactMap { $0 as? NSScrollView }.first)
         let scroller = try #require(scrollView.verticalScroller)
@@ -580,6 +585,7 @@ struct ZoneViewScrollingTests {
             )
         })
         view.layoutSubtreeIfNeeded()
+        try enterZone(view, in: window)
 
         let scrollView = try #require(view.subviews.compactMap { $0 as? NSScrollView }.first)
         let scroller = try #require(scrollView.verticalScroller)
@@ -608,6 +614,7 @@ struct ZoneViewScrollingTests {
             )
         })
         view.layoutSubtreeIfNeeded()
+        try enterZone(view)
 
         let scrollView = try #require(view.subviews.compactMap { $0 as? NSScrollView }.first)
         let scroller = try #require(scrollView.verticalScroller)
@@ -646,6 +653,7 @@ struct ZoneViewScrollingTests {
             )
         })
         view.layoutSubtreeIfNeeded()
+        try enterZone(view, in: window)
 
         let scrollView = try #require(view.subviews.compactMap { $0 as? NSScrollView }.first)
         let scroller = try #require(scrollView.verticalScroller)
@@ -729,6 +737,21 @@ struct ZoneViewScrollingTests {
         scroller.mouseDragged(with: dragEvent)
 
         #expect(scrollView.contentView.bounds.origin.y > 0)
+    }
+
+    private func enterZone(_ view: ZoneView, in window: NSWindow? = nil) throws {
+        let event = try #require(NSEvent.mouseEvent(
+            with: .mouseMoved,
+            location: NSPoint(x: view.bounds.midX, y: view.bounds.midY),
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window?.windowNumber ?? 0,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 0,
+            pressure: 0
+        ))
+        view.mouseEntered(with: event)
     }
 }
 
