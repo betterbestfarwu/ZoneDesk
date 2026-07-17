@@ -138,6 +138,7 @@ private enum ZoneMouseLog {
     }
 }
 
+@MainActor
 final class ZoneWindow: NSWindow {
     private static let desktopOverlayLevel = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
 
@@ -153,6 +154,14 @@ final class ZoneWindow: NSWindow {
             zoneView.onOpenFile = onOpenFile
         }
     }
+    var onRenameFile: ((URL, String) -> Result<URL, Error>)? {
+        get { zoneView.onRenameFile }
+        set { zoneView.onRenameFile = newValue }
+    }
+    var onPresentFileError: ((String) -> Void)? {
+        get { zoneView.onPresentFileError }
+        set { zoneView.onPresentFileError = newValue }
+    }
 
     override var canBecomeKey: Bool {
         true
@@ -162,9 +171,15 @@ final class ZoneWindow: NSWindow {
         true
     }
 
-    init(zone: ZoneModel) {
+    init(
+        zone: ZoneModel,
+        fileContextMenuController: ZoneFileContextMenuController? = nil
+    ) {
         self.zone = zone
-        self.zoneView = ZoneView(zone: zone)
+        self.zoneView = ZoneView(
+            zone: zone,
+            fileContextMenuController: fileContextMenuController
+        )
 
         super.init(
             contentRect: zone.rect.nsRect,
@@ -217,6 +232,10 @@ final class ZoneWindow: NSWindow {
         if isEditing {
             orderFrontRegardless()
         }
+    }
+
+    func beginRenamingFile(at url: URL) {
+        zoneView.beginRenamingFile(at: url)
     }
 
     override func sendEvent(_ event: NSEvent) {
@@ -406,6 +425,7 @@ private final class ZoneFileThumbnailPayload: @unchecked Sendable {
     }
 }
 
+@MainActor
 final class ZoneFilesView: NSView, NSTextFieldDelegate {
     private struct Cell {
         var file: ZoneStoredFile
@@ -426,6 +446,9 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
     private var renamingFileURL: URL?
     private weak var renameCommandEditor: NSTextField?
     private(set) var selectedFileURL: URL?
+    var zoneID = UUID()
+    var fileSortOrder: ZoneFileSortOrder = .name
+    var fileContextMenuController = ZoneFileContextMenuController()
 
     var thumbnailProvider: ZoneFileThumbnailProviding = ZoneFileThumbnailProvider() {
         didSet {
@@ -551,6 +574,23 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         if event.clickCount >= 2 {
             onOpenFile?(cell.file.url)
         }
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        layoutSubtreeIfNeeded()
+        let point = convert(event.locationInWindow, from: nil)
+        let cell = cells.first(where: { $0.frame.contains(point) })
+        selectedFileURL = cell?.file.url
+        needsDisplay = true
+        displayIfNeeded()
+
+        return fileContextMenuController.menu(for: ZoneFileContext(
+            zoneID: zoneID,
+            file: cell?.file,
+            anchorView: self,
+            anchorRect: cell?.frame ?? NSRect(origin: point, size: .zero),
+            fileSortOrder: fileSortOrder
+        ))
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -973,6 +1013,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
     }
 }
 
+@MainActor
 final class ZoneView: NSView {
     private enum DragMode {
         case move
@@ -1044,10 +1085,25 @@ final class ZoneView: NSView {
         get { filesView.onOpenFile }
         set { filesView.onOpenFile = newValue }
     }
+    var onRenameFile: ((URL, String) -> Result<URL, Error>)? {
+        get { filesView.onRenameFile }
+        set { filesView.onRenameFile = newValue }
+    }
+    var onPresentFileError: ((String) -> Void)? {
+        get { filesView.onPresentError }
+        set { filesView.onPresentError = newValue }
+    }
 
-    init(zone: ZoneModel) {
+    init(
+        zone: ZoneModel,
+        fileContextMenuController: ZoneFileContextMenuController? = nil
+    ) {
         self.zone = zone
         super.init(frame: zone.rect.nsRect)
+        filesView.zoneID = zone.id
+        filesView.fileSortOrder = zone.fileSortOrder
+        filesView.fileContextMenuController = fileContextMenuController
+            ?? ZoneFileContextMenuController()
         wantsLayer = true
         filesScrollView.drawsBackground = false
         filesScrollView.scrollerStyle = .overlay
@@ -1069,12 +1125,18 @@ final class ZoneView: NSView {
 
     func update(zone: ZoneModel, isEditing: Bool, isSelected: Bool) {
         self.zone = zone
+        filesView.zoneID = zone.id
+        filesView.fileSortOrder = zone.fileSortOrder
         self.isEditing = isEditing
         self.isSelected = isSelected
         filesScrollView.isHidden = isEditing
         deleteButton.isHidden = !isEditing
         updateScrollerVisibility()
         needsDisplay = true
+    }
+
+    func beginRenamingFile(at url: URL) {
+        filesView.beginRenaming(url: url)
     }
 
     func setFiles(
@@ -1327,9 +1389,11 @@ final class ZoneView: NSView {
     }
 }
 
+@MainActor
 final class WindowManager {
     private var windows: [UUID: ZoneWindow] = [:]
     private var filesByZoneID: [UUID: [ZoneStoredFile]] = [:]
+    private let fileContextMenuController = ZoneFileContextMenuController()
     private var isEditing = false
     private var selectedZoneID: UUID?
     private(set) var currentFileLayout = FinderDesktopIconLayout.finderDefault
@@ -1339,14 +1403,63 @@ final class WindowManager {
     var onDeleteRequested: ((UUID) -> Void)?
     var onSelectionChanged: (() -> Void)?
     var onOpenFile: ((URL) -> Void)?
+    var onCreateFolder: ((UUID) -> Void)?
+    var onChangeSortOrder: ((UUID, ZoneFileSortOrder) -> Void)?
+    var onRenameFile: ((UUID, URL, String) -> Result<URL, Error>)?
+    var onTrashFile: ((UUID, URL) -> Void)?
+    var onRefreshFiles: ((UUID) -> Void)?
+    var onPresentFileError: ((String, String) -> Void)?
+
+    init() {
+        fileContextMenuController.onCreateFolder = { [weak self] zoneID in
+            self?.onCreateFolder?(zoneID)
+        }
+        fileContextMenuController.onChangeSortOrder = { [weak self] zoneID, order in
+            self?.onChangeSortOrder?(zoneID, order)
+        }
+        fileContextMenuController.onRename = { [weak self] context in
+            guard let url = context.file?.url else {
+                return
+            }
+            self?.windows[context.zoneID]?.beginRenamingFile(at: url)
+        }
+        fileContextMenuController.onTrash = { [weak self] context in
+            guard let url = context.file?.url else {
+                return
+            }
+            self?.onTrashFile?(context.zoneID, url)
+        }
+        fileContextMenuController.onRefresh = { [weak self] zoneID in
+            self?.onRefreshFiles?(zoneID)
+        }
+        fileContextMenuController.onPresentError = { [weak self] message, details in
+            self?.onPresentFileError?(message, details)
+        }
+    }
 
     func show(zones: [ZoneModel], filesByZoneID: [UUID: [ZoneStoredFile]] = [:]) {
         self.filesByZoneID = filesByZoneID
         closeAll()
         for zone in zones {
-            let window = ZoneWindow(zone: zone)
+            let window = ZoneWindow(
+                zone: zone,
+                fileContextMenuController: fileContextMenuController
+            )
             window.onOpenFile = { [weak self] url in
                 self?.onOpenFile?(url)
+            }
+            window.onRenameFile = { [weak self] url, name in
+                guard let self, let onRenameFile = self.onRenameFile else {
+                    return .failure(NSError(
+                        domain: "ZoneDesk.ZoneFileRename",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "重命名服务暂不可用。"]
+                    ))
+                }
+                return onRenameFile(zone.id, url, name)
+            }
+            window.onPresentFileError = { [weak self] details in
+                self?.onPresentFileError?("无法重新命名", details)
             }
             window.onSelect = { [weak self] zoneID in
                 self?.selectZone(id: zoneID)
@@ -1406,6 +1519,26 @@ final class WindowManager {
                 fileLayout: currentFileLayout
             )
         }
+    }
+
+    func updateFiles(
+        _ files: [ZoneStoredFile],
+        for zone: ZoneModel,
+        fileLayout: FinderDesktopIconLayout
+    ) {
+        filesByZoneID[zone.id] = files
+        currentFileLayout = fileLayout
+        windows[zone.id]?.update(
+            zone: zone,
+            isEditing: isEditing,
+            isSelected: zone.id == selectedZoneID,
+            files: files,
+            fileLayout: currentFileLayout
+        )
+    }
+
+    func selectAndRenameFile(at url: URL, in zoneID: UUID) {
+        windows[zoneID]?.beginRenamingFile(at: url)
     }
 
     func selectedZone(in zones: [ZoneModel]) -> ZoneModel? {
@@ -1505,6 +1638,7 @@ final class DesktopFileWatcher {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private enum FinderPreparationResult {
         case ready
@@ -1597,6 +1731,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowManager.onOpenFile = { [weak self] url in
             self?.openStoredFile(url)
         }
+        windowManager.onCreateFolder = { [weak self] zoneID in
+            self?.createFolder(in: zoneID)
+        }
+        windowManager.onChangeSortOrder = { [weak self] zoneID, order in
+            self?.changeFileSortOrder(order, in: zoneID)
+        }
+        windowManager.onRenameFile = { [weak self] zoneID, url, name in
+            self?.renameStoredFile(url, to: name, in: zoneID)
+                ?? .failure(NSError(
+                    domain: "ZoneDesk.ZoneFileRename",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "重命名服务已停止。"]
+                ))
+        }
+        windowManager.onTrashFile = { [weak self] zoneID, url in
+            self?.trashStoredFile(url, in: zoneID)
+        }
+        windowManager.onRefreshFiles = { [weak self] zoneID in
+            self?.refreshZoneFiles(zoneID: zoneID)
+        }
+        windowManager.onPresentFileError = { [weak self] message, details in
+            self?.showError(message: message, informativeText: details)
+        }
     }
 
     private func configureWatcher() {
@@ -1624,7 +1781,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var refreshed: [UUID: [ZoneStoredFile]] = [:]
         for zone in config.zones {
             do {
-                refreshed[zone.id] = try zoneLibrary.files(in: zone)
+                let files = try zoneLibrary.files(in: zone)
+                refreshed[zone.id] = ZoneStoredFileSorter.sorted(
+                    files,
+                    by: zone.fileSortOrder
+                )
             } catch {
                 refreshed[zone.id] = []
                 NSLog("ZoneDesk: failed to list files for zone \(zone.name): \(error)")
@@ -1636,6 +1797,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             refreshed,
             fileLayout: currentFinderFileLayout()
         )
+    }
+
+    private func refreshZoneFiles(zoneID: UUID) {
+        guard let zone = config.zones.first(where: { $0.id == zoneID }) else {
+            return
+        }
+
+        do {
+            let files = ZoneStoredFileSorter.sorted(
+                try zoneLibrary.files(in: zone),
+                by: zone.fileSortOrder
+            )
+            filesByZoneID[zone.id] = files
+            windowManager.updateFiles(
+                files,
+                for: zone,
+                fileLayout: currentFinderFileLayout()
+            )
+        } catch {
+            NSLog("ZoneDesk: failed to list files for zone \(zone.name): \(error)")
+            showError(
+                message: "无法刷新分区",
+                informativeText: error.localizedDescription
+            )
+        }
     }
 
     private func currentFinderFileLayout() -> FinderDesktopIconLayout {
@@ -1653,6 +1839,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         NSWorkspace.shared.open(url)
+    }
+
+    private func createFolder(in zoneID: UUID) {
+        guard let zone = config.zones.first(where: { $0.id == zoneID }) else {
+            return
+        }
+
+        do {
+            let url = try zoneLibrary.createFolder(
+                in: zone,
+                preferredName: "新建文件夹"
+            )
+            refreshZoneFiles(zoneID: zoneID)
+            windowManager.selectAndRenameFile(at: url, in: zoneID)
+        } catch {
+            NSLog("ZoneDesk: failed to create folder in zone \(zone.name): \(error)")
+            showError(
+                message: "无法新建文件夹",
+                informativeText: error.localizedDescription
+            )
+        }
+    }
+
+    private func changeFileSortOrder(_ order: ZoneFileSortOrder, in zoneID: UUID) {
+        guard let index = config.zones.firstIndex(where: { $0.id == zoneID }) else {
+            return
+        }
+
+        var updatedConfig = config!
+        updatedConfig.zones[index].fileSortOrder = order
+        do {
+            try configManager.save(updatedConfig)
+        } catch {
+            NSLog("ZoneDesk: failed to save file sort order for zone \(config.zones[index].name): \(error)")
+            showError(
+                message: "无法更改排序方式",
+                informativeText: "配置保存失败，已保留原排序。\n\(error.localizedDescription)"
+            )
+            return
+        }
+
+        config = updatedConfig
+        refreshZoneFiles(zoneID: zoneID)
+    }
+
+    private func renameStoredFile(
+        _ url: URL,
+        to newName: String,
+        in zoneID: UUID
+    ) -> Result<URL, Error> {
+        guard let zone = config.zones.first(where: { $0.id == zoneID }) else {
+            return .failure(NSError(
+                domain: "ZoneDesk.ZoneFileRename",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "找不到该项目所属的分区。"]
+            ))
+        }
+
+        do {
+            let renamedURL = try zoneLibrary.renameStoredItem(
+                at: url,
+                to: newName,
+                in: zone
+            )
+            refreshZoneFiles(zoneID: zoneID)
+            return .success(renamedURL)
+        } catch {
+            NSLog("ZoneDesk: failed to rename stored item \(url.path): \(error)")
+            return .failure(error)
+        }
+    }
+
+    private func trashStoredFile(_ url: URL, in zoneID: UUID) {
+        do {
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            refreshZoneFiles(zoneID: zoneID)
+        } catch {
+            NSLog("ZoneDesk: failed to trash stored item \(url.path): \(error)")
+            showError(
+                message: "无法移到废纸篓",
+                informativeText: error.localizedDescription
+            )
+        }
     }
 
     @objc private func collectDesktopFiles() {
@@ -2011,7 +2280,9 @@ private extension NSRect {
     }
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
+MainActor.assumeIsolated {
+    let app = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.run()
+}

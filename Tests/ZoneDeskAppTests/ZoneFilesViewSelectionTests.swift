@@ -6,6 +6,65 @@ import ZoneDeskCore
 @Suite("Zone file selection")
 @MainActor
 struct ZoneFilesViewSelectionTests {
+    @Test("blank context menu clears selection and contains new folder and sorting")
+    func blankContextMenu() throws {
+        let fixture = try ZoneFilesViewFixture(fileCount: 1)
+        fixture.clickFile(at: 0)
+        fixture.view.fileSortOrder = .dateModified
+        var createdZoneID: UUID?
+        var changedSortOrder: ZoneFileSortOrder?
+        fixture.view.fileContextMenuController.onCreateFolder = { createdZoneID = $0 }
+        fixture.view.fileContextMenuController.onChangeSortOrder = { _, order in
+            changedSortOrder = order
+        }
+
+        let menu = try #require(fixture.view.menu(for: fixture.rightClickEvent(at: NSPoint(x: 2, y: 2))))
+
+        #expect(fixture.view.selectedFileURL == nil)
+        #expect(menu.items.map { $0.isSeparatorItem ? "|" : $0.title } == [
+            "新建文件夹", "|", "排序方式",
+        ])
+        let sortMenu = try #require(menu.items.first(where: { $0.title == "排序方式" })?.submenu)
+        #expect(sortMenu.items.map(\.title) == [
+            "名称", "种类", "上次打开日期", "添加日期",
+            "修改日期", "创建日期", "大小", "标签",
+        ])
+        #expect(sortMenu.items.first(where: { $0.title == "修改日期" })?.state == .on)
+        #expect(sortMenu.items.filter { $0.state == .on }.count == 1)
+
+        invoke(menu.items[0])
+        invoke(sortMenu.items[7])
+        #expect(createdZoneID == fixture.view.zoneID)
+        #expect(changedSortOrder == .tags)
+    }
+
+    @Test("item context menu selects item and exposes Finder core actions")
+    func itemContextMenu() throws {
+        let fixture = try ZoneFilesViewFixture(fileCount: 1)
+        let frame = try #require(fixture.view.fileFrame(at: 0))
+        var renamedURL: URL?
+        var trashedURL: URL?
+        fixture.view.fileContextMenuController.onRename = { renamedURL = $0.file?.url }
+        fixture.view.fileContextMenuController.onTrash = { trashedURL = $0.file?.url }
+
+        let menu = try #require(fixture.view.menu(for: fixture.rightClickEvent(at: NSPoint(x: frame.midX, y: frame.midY))))
+
+        #expect(fixture.view.selectedFileURL == fixture.files[0].url)
+        #expect(menu.items.map { $0.isSeparatorItem ? "|" : $0.title } == [
+            "打开", "打开方式", "|", "移到废纸篓", "|", "显示简介",
+            "重新命名", "复制", "快速查看", "共享", "|", "在 Finder 中显示",
+        ])
+
+        if let renameItem = menu.items.first(where: { $0.title == "重新命名" }) {
+            invoke(renameItem)
+        }
+        if let trashItem = menu.items.first(where: { $0.title == "移到废纸篓" }) {
+            invoke(trashItem)
+        }
+        #expect(renamedURL == fixture.files[0].url)
+        #expect(trashedURL == fixture.files[0].url)
+    }
+
     @Test("media requests an injected thumbnail and documents retain icons")
     func mediaThumbnailRouting() throws {
         let provider = ImmediateThumbnailProvider()
@@ -761,6 +820,14 @@ private final class DeferredThumbnailProvider: ZoneFileThumbnailProviding {
 }
 
 @MainActor
+private func invoke(_ item: NSMenuItem) {
+    guard let action = item.action else {
+        return
+    }
+    NSApp.sendAction(action, to: item.target, from: item)
+}
+
+@MainActor
 private func captureBitmap(of view: NSView) throws -> NSBitmapImageRep {
     view.displayIfNeeded()
     let bitmap = try #require(view.bitmapImageRepForCachingDisplay(in: view.bounds))
@@ -822,6 +889,20 @@ private final class ZoneFilesViewFixture {
             context: nil,
             eventNumber: 0,
             clickCount: clickCount,
+            pressure: 1
+        )!
+    }
+
+    func rightClickEvent(at point: NSPoint) -> NSEvent {
+        NSEvent.mouseEvent(
+            with: .rightMouseDown,
+            location: view.convert(point, to: nil),
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
             pressure: 1
         )!
     }
