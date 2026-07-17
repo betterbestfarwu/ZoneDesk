@@ -489,8 +489,8 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
     var zoneID = UUID()
     var fileSortOrder: ZoneFileSortOrder = .name
     var fileContextMenuController = ZoneFileContextMenuController()
-    var quickLookPanelProvider: () -> ZoneQuickLookPanelAdapting = {
-        QLPreviewPanel.shared()!
+    var quickLookPanelProvider: () -> ZoneQuickLookPanelAdapting? = {
+        QLPreviewPanel.shared()
     }
 
     var thumbnailProvider: ZoneFileThumbnailProviding = ZoneFileThumbnailProvider() {
@@ -768,7 +768,11 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
 
         window.makeFirstResponder(self)
         window.makeKey()
-        let panel = quickLookPanelProvider()
+        guard let panel = quickLookPanelProvider() else {
+            quickLookDataSource = nil
+            onPresentError?("无法快速查看：快速查看面板不可用。")
+            return
+        }
         _ = presentPreparedQuickLook(using: panel)
     }
 
@@ -834,7 +838,9 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
             return
         }
 
-        guard isValidRename(editor.stringValue) else {
+        do {
+            try ZoneStoredItemNameValidator.validate(editor.stringValue)
+        } catch {
             keepRenameEditorActive(
                 editor,
                 error: ZoneFileRenameValidationError(name: editor.stringValue)
@@ -905,14 +911,6 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
             }
             self.renameCommandEditor = nil
         }
-    }
-
-    private func isValidRename(_ name: String) -> Bool {
-        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !trimmedName.isEmpty
-            && !name.contains("/")
-            && name != "."
-            && name != ".."
     }
 
     private func keepRenameEditorActive(_ editor: NSTextField, error: Error) {
@@ -1026,11 +1024,15 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
               [.image, .screenshot, .video].contains(file.category) else {
             return nil
         }
+        let backingScaleFactor = window?.backingScaleFactor ?? 1
+        let scale = backingScaleFactor.isFinite && backingScaleFactor > 0
+            ? backingScaleFactor
+            : 1
         return ZoneFileThumbnailCacheKey(
             url: file.url,
             modificationDate: file.modificationDate,
-            pixelWidth: Int(ceil(size.width)),
-            pixelHeight: Int(ceil(size.height))
+            pixelWidth: Int(ceil(size.width * scale)),
+            pixelHeight: Int(ceil(size.height * scale))
         )
     }
 
@@ -1047,7 +1049,10 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
 
             cells[index].thumbnail = nil
             cells[index].thumbnailRequestKey = requestKey
-            let requestedSize = cells[index].iconFrame.size
+            let requestedSize = NSSize(
+                width: requestKey.pixelWidth,
+                height: requestKey.pixelHeight
+            )
             thumbnailProvider.thumbnail(
                 for: file,
                 size: requestedSize

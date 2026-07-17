@@ -69,6 +69,66 @@ struct ZoneLibraryTests {
         #expect(moves[1].1 == result)
     }
 
+    @Test("case-only rename reports both destination and rollback failures")
+    func caseOnlyRenameReportsRollbackFailure() throws {
+        let fixture = try TemporaryZoneLibraryFixture()
+        defer { fixture.cleanUp() }
+        let zone = fixture.zone(name: "资料", categories: [.other])
+        let source = try fixture.writeZoneFile(named: "draft.txt", contents: "original", in: zone)
+        let destination = source.deletingLastPathComponent().appendingPathComponent("Draft.txt")
+        var moves: [(URL, URL)] = []
+        let library = ZoneLibrary(
+            rootURL: fixture.rootURL,
+            volumeSupportsCaseSensitiveNames: { _ in false },
+            renameMoveItem: { from, to in
+                moves.append((from, to))
+                switch moves.count {
+                case 1:
+                    try FileManager.default.moveItem(at: from, to: to)
+                case 2:
+                    throw RenameMoveTestError.destinationMove
+                case 3:
+                    throw RenameMoveTestError.rollbackMove
+                default:
+                    Issue.record("Unexpected extra rename move")
+                }
+            }
+        )
+
+        do {
+            _ = try library.renameStoredItem(at: source, to: "Draft.txt", in: zone)
+            Issue.record("Expected rename and rollback to fail")
+        } catch let error as ZoneLibraryError {
+            guard case let .caseOnlyRenameRollbackFailed(
+                original,
+                temporary,
+                failedDestination,
+                renameFailure,
+                rollbackFailure
+            ) = error else {
+                Issue.record("Unexpected ZoneLibraryError: \(error)")
+                return
+            }
+            #expect(original == source.standardizedFileURL)
+            #expect(temporary == moves[0].1)
+            #expect(failedDestination == destination)
+            #expect(renameFailure == "Destination move failed.")
+            #expect(rollbackFailure == "Rollback move failed.")
+            #expect(error.localizedDescription.contains(original.path))
+            #expect(error.localizedDescription.contains(temporary.path))
+            #expect(error.localizedDescription.contains(failedDestination.path))
+            #expect(error.localizedDescription.contains(renameFailure))
+            #expect(error.localizedDescription.contains(rollbackFailure))
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+
+        #expect(moves.count == 3)
+        #expect(!FileManager.default.fileExists(atPath: source.path))
+        #expect(FileManager.default.fileExists(atPath: moves[0].1.path))
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
+    }
+
     @Test("rejects invalid folder names without escaping the zone")
     func rejectsInvalidFolderNames() throws {
         let fixture = try TemporaryZoneLibraryFixture()
@@ -85,6 +145,18 @@ struct ZoneLibraryTests {
         }
 
         #expect(!FileManager.default.fileExists(atPath: outside.path))
+    }
+
+    @Test("stored item names use one public validator")
+    func validatesStoredItemNames() throws {
+        try ZoneStoredItemNameValidator.validate("report.pdf")
+        try ZoneStoredItemNameValidator.validate(" spaced name ")
+
+        for invalidName in ["", "   ", ".", "..", "nested/name", "../outside"] {
+            #expect(throws: ZoneLibraryError.invalidItemName(invalidName)) {
+                try ZoneStoredItemNameValidator.validate(invalidName)
+            }
+        }
     }
 
     @Test("loads stored file metadata")
@@ -129,7 +201,7 @@ struct ZoneLibraryTests {
 
         let files = try library.files(in: zone)
 
-        #expect(files.map(\.displayName) == ["readable.txt", "unreadable.txt"])
+        #expect(Set(files.map(\.displayName)) == ["readable.txt", "unreadable.txt"])
         #expect(files.first { $0.displayName == readable.lastPathComponent }?.fileSize == 7)
         let fallback = try #require(files.first { $0.displayName == unreadable.lastPathComponent })
         #expect(!fallback.isDirectory)
@@ -298,18 +370,28 @@ struct ZoneLibraryTests {
         #expect(report.moves.first?.destination.lastPathComponent == "report 2.pdf")
     }
 
-    @Test("lists stored files sorted by localized name")
-    func listsStoredFilesSortedByLocalizedName() throws {
+    @Test("lists stored files in provider enumeration order")
+    func listsStoredFilesInEnumerationOrder() throws {
         let fixture = try TemporaryZoneLibraryFixture()
         defer { fixture.cleanUp() }
         let documentZone = fixture.zone(name: "文档", categories: [.document])
         let directory = try fixture.library.ensureDirectory(for: documentZone)
-        try Data().write(to: directory.appendingPathComponent("b.pdf"))
-        try Data().write(to: directory.appendingPathComponent("a.pdf"))
+        let b = directory.appendingPathComponent("b.pdf")
+        let a = directory.appendingPathComponent("a.pdf")
+        let library = ZoneLibrary(
+            rootURL: fixture.rootURL,
+            contentsOfDirectory: { requestedDirectory, _, _ in
+                #expect(requestedDirectory == directory)
+                return [b, a]
+            },
+            resourceValuesReader: { _, _ in
+                ZoneFileResourceValues(isHidden: false, isDirectory: false)
+            }
+        )
 
-        let files = try fixture.library.files(in: documentZone)
+        let files = try library.files(in: documentZone)
 
-        #expect(files.map(\.displayName) == ["a.pdf", "b.pdf"])
+        #expect(files.map(\.displayName) == ["b.pdf", "a.pdf"])
         #expect(files.map(\.category) == [.document, .document])
     }
 
@@ -409,6 +491,20 @@ struct ZoneLibraryTests {
 
 private enum MetadataReaderError: Error {
     case expected
+}
+
+private enum RenameMoveTestError: LocalizedError {
+    case destinationMove
+    case rollbackMove
+
+    var errorDescription: String? {
+        switch self {
+        case .destinationMove:
+            return "Destination move failed."
+        case .rollbackMove:
+            return "Rollback move failed."
+        }
+    }
 }
 
 private struct TemporaryZoneLibraryFixture {

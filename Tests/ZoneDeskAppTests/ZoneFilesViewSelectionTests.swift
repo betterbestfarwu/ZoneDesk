@@ -142,6 +142,19 @@ struct ZoneFilesViewSelectionTests {
         #expect(message == "无法获取快速查看控制权。")
     }
 
+    @Test("Quick Look reports an unavailable shared panel without crashing")
+    func quickLookHandlesUnavailablePanel() throws {
+        let fixture = try ZoneFilesViewFixture(fileCount: 1)
+        var message: String?
+        fixture.view.quickLookPanelProvider = { nil }
+        fixture.view.onPresentError = { message = $0 }
+
+        fixture.view.presentQuickLook(url: fixture.files[0].url)
+
+        #expect(fixture.view.quickLookDataSourceForTesting == nil)
+        #expect(message == "无法快速查看：快速查看面板不可用。")
+    }
+
     @Test("WindowManager routes menu actions with the captured zone identifier")
     func windowManagerRoutesCapturedZoneID() {
         let manager = WindowManager()
@@ -404,6 +417,33 @@ struct ZoneFilesViewSelectionTests {
         _ = try fixture.renderedBitmap()
 
         #expect(provider.requestedURLs == [URL(fileURLWithPath: "/tmp/photo.png")])
+    }
+
+    @Test("Retina thumbnail requests use pixels while layout stays in points")
+    func retinaThumbnailUsesBackingScale() throws {
+        let provider = ImmediateThumbnailProvider(
+            image: makeSolidImage(size: NSSize(width: 96, height: 96))
+        )
+        let layout = FinderDesktopIconLayout(iconSize: 48, gridSpacing: 46, textSize: 12)
+        let fixture = try ZoneFilesViewFixture(
+            fileCount: 0,
+            layout: layout,
+            thumbnailProvider: provider,
+            backingScaleFactor: 2
+        )
+        fixture.view.setFiles([
+            ZoneStoredFile(
+                url: URL(fileURLWithPath: "/tmp/retina.png"),
+                displayName: "retina.png",
+                category: .image
+            ),
+        ], layout: layout)
+        fixture.view.layoutSubtreeIfNeeded()
+
+        #expect(provider.requestedSizes == [NSSize(width: 96, height: 96)])
+        let iconSelection = try #require(fixture.view.selectionRects(at: 0)?.icon)
+        #expect(iconSelection.width - 8 == 48)
+        #expect(iconSelection.height - 8 == 48)
     }
 
     @Test("thumbnail requests are not repeated by layout")
@@ -1190,6 +1230,7 @@ private enum RenameTestError: LocalizedError {
 @MainActor
 private final class ImmediateThumbnailProvider: ZoneFileThumbnailProviding {
     private(set) var requestedURLs: [URL] = []
+    private(set) var requestedSizes: [NSSize] = []
     private let image: NSImage
 
     init(image: NSImage? = nil) {
@@ -1202,6 +1243,7 @@ private final class ImmediateThumbnailProvider: ZoneFileThumbnailProviding {
         completion: @escaping (NSImage?) -> Void
     ) {
         requestedURLs.append(file.url)
+        requestedSizes.append(size)
         completion(image)
     }
 }
@@ -1290,7 +1332,8 @@ private final class ZoneFilesViewFixture {
     init(
         fileCount: Int,
         layout: FinderDesktopIconLayout = .finderDefault,
-        thumbnailProvider: ZoneFileThumbnailProviding? = nil
+        thumbnailProvider: ZoneFileThumbnailProviding? = nil,
+        backingScaleFactor: CGFloat? = nil
     ) throws {
         view = ZoneFilesView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
         if let thumbnailProvider {
@@ -1303,12 +1346,19 @@ private final class ZoneFilesViewFixture {
                 category: .document
             )
         }
-        window = NSWindow(
-            contentRect: view.frame,
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
+        if let backingScaleFactor {
+            window = FixedBackingScaleWindow(
+                contentRect: view.frame,
+                backingScaleFactor: backingScaleFactor
+            )
+        } else {
+            window = NSWindow(
+                contentRect: view.frame,
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: false
+            )
+        }
         window.contentView = view
         view.setFiles(files, layout: layout)
         view.layoutSubtreeIfNeeded()
@@ -1359,5 +1409,24 @@ private final class ZoneFilesViewFixture {
 
     var renameField: NSTextField? {
         view.subviews.compactMap { $0 as? NSTextField }.first
+    }
+}
+
+@MainActor
+private final class FixedBackingScaleWindow: NSWindow {
+    private let fixedBackingScaleFactor: CGFloat
+
+    init(contentRect: NSRect, backingScaleFactor: CGFloat) {
+        fixedBackingScaleFactor = backingScaleFactor
+        super.init(
+            contentRect: contentRect,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+    }
+
+    override var backingScaleFactor: CGFloat {
+        fixedBackingScaleFactor
     }
 }

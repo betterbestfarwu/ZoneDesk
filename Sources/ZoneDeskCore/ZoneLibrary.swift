@@ -152,6 +152,13 @@ public enum ZoneLibraryError: Error, Equatable, CustomStringConvertible, Localiz
     case invalidItemName(String)
     case destinationItemExists(URL)
     case sourceOutsideZone(URL)
+    case caseOnlyRenameRollbackFailed(
+        original: URL,
+        temporary: URL,
+        destination: URL,
+        renameFailure: String,
+        rollbackFailure: String
+    )
 
     public var description: String {
         switch self {
@@ -163,6 +170,15 @@ public enum ZoneLibraryError: Error, Equatable, CustomStringConvertible, Localiz
             return "Destination item already exists: \(url.path)"
         case let .sourceOutsideZone(url):
             return "Source item is outside the zone directory: \(url.path)"
+        case let .caseOnlyRenameRollbackFailed(
+            original,
+            temporary,
+            destination,
+            renameFailure,
+            rollbackFailure
+        ):
+            return "Case-only rename failed from \(original.path) via \(temporary.path) "
+                + "to \(destination.path): \(renameFailure) Rollback failed: \(rollbackFailure)"
         }
     }
 
@@ -171,9 +187,27 @@ public enum ZoneLibraryError: Error, Equatable, CustomStringConvertible, Localiz
     }
 }
 
+public enum ZoneStoredItemNameValidator {
+    public static func validate(_ name: String) throws {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty,
+              !name.contains("/"),
+              name != ".",
+              name != ".."
+        else {
+            throw ZoneLibraryError.invalidItemName(name)
+        }
+    }
+}
+
 public struct ZoneLibrary {
     public var rootURL: URL
     public var fileManager: FileManager
+    private var contentsOfDirectory: (
+        URL,
+        [URLResourceKey]?,
+        FileManager.DirectoryEnumerationOptions
+    ) throws -> [URL]
     private var resourceValuesReader: (URL, Set<URLResourceKey>) throws -> ZoneFileResourceValues
     private var volumeSupportsCaseSensitiveNames: (URL) -> Bool?
     private var renameMoveItem: (URL, URL) throws -> Void
@@ -181,6 +215,13 @@ public struct ZoneLibrary {
     public init(rootURL: URL? = nil, fileManager: FileManager = .default) {
         self.rootURL = rootURL ?? Self.defaultRootURL()
         self.fileManager = fileManager
+        contentsOfDirectory = { url, keys, options in
+            try fileManager.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: keys,
+                options: options
+            )
+        }
         resourceValuesReader = { url, keys in
             ZoneFileResourceValues(try url.resourceValues(forKeys: keys))
         }
@@ -196,6 +237,11 @@ public struct ZoneLibrary {
     init(
         rootURL: URL,
         fileManager: FileManager = .default,
+        contentsOfDirectory: ((
+            URL,
+            [URLResourceKey]?,
+            FileManager.DirectoryEnumerationOptions
+        ) throws -> [URL])? = nil,
         resourceValuesReader: @escaping (URL, Set<URLResourceKey>) throws -> ZoneFileResourceValues = { url, keys in
             ZoneFileResourceValues(try url.resourceValues(forKeys: keys))
         },
@@ -207,6 +253,13 @@ public struct ZoneLibrary {
     ) {
         self.rootURL = rootURL
         self.fileManager = fileManager
+        self.contentsOfDirectory = contentsOfDirectory ?? { url, keys, options in
+            try fileManager.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: keys,
+                options: options
+            )
+        }
         self.resourceValuesReader = resourceValuesReader
         self.volumeSupportsCaseSensitiveNames = volumeSupportsCaseSensitiveNames
         self.renameMoveItem = renameMoveItem ?? { from, to in
@@ -277,10 +330,10 @@ public struct ZoneLibrary {
             .creationDateKey,
             .tagNamesKey,
         ]
-        let urls = try fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: Array(resourceKeys),
-            options: [.skipsPackageDescendants]
+        let urls = try contentsOfDirectory(
+            directory,
+            Array(resourceKeys),
+            [.skipsPackageDescendants]
         )
 
         return urls.compactMap { url in
@@ -313,12 +366,11 @@ public struct ZoneLibrary {
                 tagNames: resourceValues.tagNames ?? []
             )
         }
-        .sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
     }
 
     public func createFolder(in zone: ZoneModel, preferredName: String) throws -> URL {
         let directory = try ensureDirectory(for: zone)
-        try validateItemName(preferredName)
+        try ZoneStoredItemNameValidator.validate(preferredName)
         var index = 1
 
         while true {
@@ -337,7 +389,7 @@ public struct ZoneLibrary {
         to newName: String,
         in zone: ZoneModel
     ) throws -> URL {
-        try validateItemName(newName)
+        try ZoneStoredItemNameValidator.validate(newName)
 
         let directory = directoryURL(for: zone).standardizedFileURL
         let standardizedSource = source.standardizedFileURL
@@ -502,17 +554,6 @@ public struct ZoneLibrary {
             .joined(separator: "-")
     }
 
-    private func validateItemName(_ name: String) throws {
-        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedName.isEmpty,
-              !name.contains("/"),
-              name != ".",
-              name != ".."
-        else {
-            throw ZoneLibraryError.invalidItemName(name)
-        }
-    }
-
     private func renameCaseOnlyStoredItem(
         from source: URL,
         to destination: URL,
@@ -526,17 +567,25 @@ public struct ZoneLibrary {
         } while fileManager.fileExists(atPath: temporaryURL.path)
 
         try renameMoveItem(source, temporaryURL)
-        guard !fileManager.fileExists(atPath: destination.path) else {
-            try? restoreRenameItem(from: temporaryURL, to: source)
-            throw ZoneLibraryError.destinationItemExists(destination)
-        }
-
         do {
+            guard !fileManager.fileExists(atPath: destination.path) else {
+                throw ZoneLibraryError.destinationItemExists(destination)
+            }
             try renameMoveItem(temporaryURL, destination)
             return destination
-        } catch {
-            try? restoreRenameItem(from: temporaryURL, to: source)
-            throw error
+        } catch let renameError {
+            do {
+                try restoreRenameItem(from: temporaryURL, to: source)
+            } catch let rollbackError {
+                throw ZoneLibraryError.caseOnlyRenameRollbackFailed(
+                    original: source,
+                    temporary: temporaryURL,
+                    destination: destination,
+                    renameFailure: renameError.localizedDescription,
+                    rollbackFailure: rollbackError.localizedDescription
+                )
+            }
+            throw renameError
         }
     }
 
