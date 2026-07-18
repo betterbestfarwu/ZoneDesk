@@ -235,6 +235,72 @@ struct ZoneFilesViewSelectionTests {
         #expect(harness.filesByZoneID[harness.zone.id] == [expected])
     }
 
+    @Test("duplicate and alias refresh only after validated mutations")
+    func duplicateAndAliasCoordination() {
+        let harness = ZoneFileOperationHarness()
+        let source = harness.filesByZoneID[harness.zone.id]![0]
+
+        _ = harness.coordinator.duplicate(source, in: harness.zone.id)
+        _ = harness.coordinator.makeAlias(source, in: harness.zone.id)
+
+        #expect(harness.duplicatedURLs == [source.url])
+        #expect(harness.aliasPairs.first?.0 == source.url)
+        #expect(harness.refreshAttempts == [harness.zone.id, harness.zone.id])
+    }
+
+    @Test("compression refreshes only after successful completion")
+    func compressionCompletionCoordination() async {
+        let harness = ZoneFileOperationHarness()
+        let source = harness.filesByZoneID[harness.zone.id]![0]
+
+        harness.coordinator.compress(source, in: harness.zone.id)
+        #expect(harness.archivePairs.count == 1)
+        #expect(harness.refreshAttempts.isEmpty)
+
+        harness.archiveCompletion?(.success(()))
+        await waitForMainQueue()
+        #expect(harness.refreshAttempts == [harness.zone.id])
+    }
+
+    @Test("stale mutation context does not invoke item services")
+    func staleMutationContextIsRejected() {
+        let harness = ZoneFileOperationHarness()
+        let outside = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/outside/file.pdf"),
+            displayName: "file.pdf",
+            category: .document
+        )
+
+        _ = harness.coordinator.duplicate(outside, in: harness.zone.id)
+        harness.coordinator.compress(outside, in: harness.zone.id)
+        _ = harness.coordinator.makeAlias(outside, in: harness.zone.id)
+
+        #expect(harness.duplicatedURLs.isEmpty)
+        #expect(harness.archivePairs.isEmpty)
+        #expect(harness.aliasPairs.isEmpty)
+        #expect(harness.presentedErrors.count == 3)
+    }
+
+    @Test("mutation operation failures use action-specific error titles")
+    func mutationErrorsUseSpecificTitles() {
+        let harness = ZoneFileOperationHarness()
+        let source = harness.filesByZoneID[harness.zone.id]![0]
+        harness.duplicateError = OperationHarnessError.expected
+        _ = harness.coordinator.duplicate(source, in: harness.zone.id)
+        harness.duplicateError = nil
+
+        harness.archiveDestinationError = OperationHarnessError.expected
+        harness.coordinator.compress(source, in: harness.zone.id)
+        harness.archiveDestinationError = nil
+
+        harness.aliasError = OperationHarnessError.expected
+        _ = harness.coordinator.makeAlias(source, in: harness.zone.id)
+
+        #expect(harness.presentedErrors.map(\.0) == [
+            "无法复制项目", "无法压缩项目", "无法制作替身",
+        ])
+    }
+
     @Test("Open With and Share keep dynamic targets alive and dispatch injected services")
     func dynamicSystemTargetsAreRetained() {
         let controller = ZoneFileContextMenuController()
@@ -331,7 +397,7 @@ struct ZoneFilesViewSelectionTests {
             anchorRect: .zero,
             fileSortOrder: .name
         ))
-        if let copyItem = menu.items.first(where: { $0.title == "复制" }) {
+        if let copyItem = menu.items.first(where: { $0.title == "拷贝" }) {
             invoke(copyItem)
         }
 
@@ -370,31 +436,67 @@ struct ZoneFilesViewSelectionTests {
         #expect(changedSortOrder == .tags)
     }
 
-    @Test("item context menu selects item and exposes Finder core actions")
-    func itemContextMenu() throws {
-        let fixture = try ZoneFilesViewFixture(fileCount: 1)
-        let frame = try #require(fixture.view.fileFrame(at: 0))
-        var renamedURL: URL?
-        var trashedURL: URL?
-        fixture.view.fileContextMenuController.onRename = { renamedURL = $0.file?.url }
-        fixture.view.fileContextMenuController.onTrash = { trashedURL = $0.file?.url }
+    @Test("folder and file context menus expose the agreed Finder actions")
+    func itemContextMenus() throws {
+        let fixture = try ZoneFilesViewFixture(fileCount: 0)
+        let folder = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/Folder", isDirectory: true),
+            displayName: "Folder",
+            category: .other,
+            isDirectory: true
+        )
+        let file = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/report.pdf"),
+            displayName: "report.pdf",
+            category: .document
+        )
+        fixture.view.setFiles([folder, file])
+        fixture.view.layoutSubtreeIfNeeded()
+        fixture.view.fileContextMenuController.onValidateItem = { _, _ in true }
+        fixture.view.fileContextMenuController.applicationURLsProvider = { _ in [] }
+        fixture.view.fileContextMenuController.sharingServicesProvider = { _ in [] }
 
-        let menu = try #require(fixture.view.menu(for: fixture.rightClickEvent(at: NSPoint(x: frame.midX, y: frame.midY))))
+        let folderFrame = try #require(fixture.view.fileFrame(at: 0))
+        let folderMenu = try #require(fixture.view.menu(for: fixture.rightClickEvent(
+            at: NSPoint(x: folderFrame.midX, y: folderFrame.midY)
+        )))
+        #expect(fixture.view.selectedFileURL == folder.url)
+        #expect(folderMenu.items.map { $0.isSeparatorItem ? "|" : $0.title } == [
+            "打开", "|", "移到废纸篓", "|", "显示简介", "重新命名",
+            "压缩“Folder”", "复制", "制作替身", "快速查看", "|",
+            "拷贝", "共享", "|", "在 Finder 中显示",
+        ])
+        #expect(!folderMenu.items.contains(where: { $0.title == "打开方式" }))
 
-        #expect(fixture.view.selectedFileURL == fixture.files[0].url)
-        #expect(menu.items.map { $0.isSeparatorItem ? "|" : $0.title } == [
+        let fileFrame = try #require(fixture.view.fileFrame(at: 1))
+        let fileMenu = try #require(fixture.view.menu(for: fixture.rightClickEvent(
+            at: NSPoint(x: fileFrame.midX, y: fileFrame.midY)
+        )))
+        #expect(fixture.view.selectedFileURL == file.url)
+        #expect(fileMenu.items.map { $0.isSeparatorItem ? "|" : $0.title } == [
             "打开", "打开方式", "|", "移到废纸篓", "|", "显示简介",
-            "重新命名", "复制", "快速查看", "共享", "|", "在 Finder 中显示",
+            "重新命名", "压缩“report.pdf”", "复制", "制作替身", "快速查看",
+            "|", "拷贝", "共享", "|", "在 Finder 中显示",
         ])
 
-        if let renameItem = menu.items.first(where: { $0.title == "重新命名" }) {
-            invoke(renameItem)
+        var duplicateCount = 0
+        var pasteboardWriteCount = 0
+        fixture.view.fileContextMenuController.onDuplicate = { _ in duplicateCount += 1 }
+        fixture.view.fileContextMenuController.pasteboardURLWriter = { _, _ in
+            pasteboardWriteCount += 1
+            return true
         }
-        if let trashItem = menu.items.first(where: { $0.title == "移到废纸篓" }) {
-            invoke(trashItem)
+        if let duplicateItem = fileMenu.items.first(where: { $0.title == "复制" }) {
+            invoke(duplicateItem)
         }
-        #expect(renamedURL == fixture.files[0].url)
-        #expect(trashedURL == fixture.files[0].url)
+        #expect(duplicateCount == 1)
+        #expect(pasteboardWriteCount == 0)
+
+        if let copyItem = fileMenu.items.first(where: { $0.title == "拷贝" }) {
+            invoke(copyItem)
+        }
+        #expect(duplicateCount == 1)
+        #expect(pasteboardWriteCount == 1)
     }
 
     @Test("media requests an injected thumbnail and documents retain icons")
@@ -1069,8 +1171,15 @@ private final class ZoneFileOperationHarness {
     var existingPaths: Set<URL>
     var saveError: Error?
     var scanError: Error?
+    var duplicateError: Error?
+    var archiveDestinationError: Error?
+    var aliasError: Error?
     var installedZones: [ZoneModel] = []
     var trashedURLs: [URL] = []
+    var duplicatedURLs: [URL] = []
+    var archivePairs: [(URL, URL)] = []
+    var aliasPairs: [(URL, URL)] = []
+    var archiveCompletion: ((Result<Void, Error>) -> Void)?
     var refreshAttempts: [UUID] = []
     var presentedErrors: [(String, String)] = []
     var events: [String] = []
@@ -1105,6 +1214,26 @@ private final class ZoneFileOperationHarness {
         trashItem: { [unowned self] url in
             trashedURLs.append(url)
             existingPaths.remove(url.standardizedFileURL)
+        },
+        duplicateItem: { [unowned self] source, _ in
+            if let duplicateError { throw duplicateError }
+            duplicatedURLs.append(source)
+            return source.deletingLastPathComponent().appendingPathComponent("large copy")
+        },
+        archiveDestination: { [unowned self] source, _ in
+            if let archiveDestinationError { throw archiveDestinationError }
+            return source.deletingLastPathComponent().appendingPathComponent("large.zip")
+        },
+        createArchive: { [unowned self] source, destination, completion in
+            archivePairs.append((source, destination))
+            archiveCompletion = completion
+        },
+        aliasDestination: { source, _ in
+            source.deletingLastPathComponent().appendingPathComponent("large alias")
+        },
+        createAlias: { [unowned self] source, destination in
+            if let aliasError { throw aliasError }
+            aliasPairs.append((source, destination))
         },
         beginRenaming: { [unowned self] _, _ in
             events.append("rename")

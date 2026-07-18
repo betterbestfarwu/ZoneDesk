@@ -1528,6 +1528,11 @@ struct ZoneFileOperationEnvironment {
     var createFolder: (ZoneModel) throws -> URL
     var renameItem: (URL, String, ZoneModel) throws -> URL
     var trashItem: (URL) throws -> Void
+    var duplicateItem: (URL, ZoneModel) throws -> URL
+    var archiveDestination: (URL, ZoneModel) throws -> URL
+    var createArchive: (URL, URL, @escaping (Result<Void, Error>) -> Void) -> Void
+    var aliasDestination: (URL, ZoneModel) throws -> URL
+    var createAlias: (URL, URL) throws -> Void
     var beginRenaming: (URL, UUID) -> Bool
     var noteRefreshAttempt: (UUID) -> Void
     var presentError: (String, String) -> Void
@@ -1745,6 +1750,92 @@ final class ZoneFileOperationCoordinator {
         }
     }
 
+    @discardableResult
+    func duplicate(_ sourceFile: ZoneStoredFile, in zoneID: UUID) -> Result<URL, Error> {
+        let zone: ZoneModel
+        switch validatedItem(zoneID: zoneID, url: sourceFile.url) {
+        case let .success(validatedZone):
+            zone = validatedZone
+        case let .failure(error):
+            rejectStaleContext(zoneID: zoneID, error: error)
+            return .failure(error)
+        }
+
+        do {
+            let destination = try environment.duplicateItem(sourceFile.url, zone)
+            refreshAfterCreating(
+                cachedFile(from: sourceFile, at: destination),
+                in: zone
+            )
+            return .success(destination)
+        } catch {
+            environment.presentError("无法复制项目", error.localizedDescription)
+            return .failure(error)
+        }
+    }
+
+    func compress(_ sourceFile: ZoneStoredFile, in zoneID: UUID) {
+        let zone: ZoneModel
+        switch validatedItem(zoneID: zoneID, url: sourceFile.url) {
+        case let .success(validatedZone):
+            zone = validatedZone
+        case let .failure(error):
+            rejectStaleContext(zoneID: zoneID, error: error)
+            return
+        }
+
+        let destination: URL
+        do {
+            destination = try environment.archiveDestination(sourceFile.url, zone)
+        } catch {
+            environment.presentError("无法压缩项目", error.localizedDescription)
+            return
+        }
+
+        environment.createArchive(sourceFile.url, destination) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success:
+                    self.refreshAfterCreating(
+                        ZoneStoredFile(
+                            url: destination,
+                            displayName: destination.lastPathComponent,
+                            category: .archive
+                        ),
+                        in: zone
+                    )
+                case let .failure(error):
+                    self.environment.presentError("无法压缩项目", error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    @discardableResult
+    func makeAlias(_ sourceFile: ZoneStoredFile, in zoneID: UUID) -> Result<URL, Error> {
+        let zone: ZoneModel
+        switch validatedItem(zoneID: zoneID, url: sourceFile.url) {
+        case let .success(validatedZone):
+            zone = validatedZone
+        case let .failure(error):
+            rejectStaleContext(zoneID: zoneID, error: error)
+            return .failure(error)
+        }
+
+        do {
+            let destination = try environment.aliasDestination(sourceFile.url, zone)
+            try environment.createAlias(sourceFile.url, destination)
+            var alias = cachedFile(from: sourceFile, at: destination)
+            alias.isDirectory = false
+            refreshAfterCreating(alias, in: zone)
+            return .success(destination)
+        } catch {
+            environment.presentError("无法制作替身", error.localizedDescription)
+            return .failure(error)
+        }
+    }
+
     private func validatedItem(zoneID: UUID, url: URL) -> Result<ZoneModel, Error> {
         let config = environment.currentConfig()
         guard let zone = config.zones.first(where: { $0.id == zoneID }) else {
@@ -1799,6 +1890,28 @@ final class ZoneFileOperationCoordinator {
         )
     }
 
+    private func refreshAfterCreating(_ createdFile: ZoneStoredFile, in zone: ZoneModel) {
+        switch refresh(zoneID: zone.id) {
+        case .success:
+            break
+        case let .failure(error):
+            var files = environment.cachedFiles(zone.id)
+            files.removeAll(where: {
+                $0.url.standardizedFileURL == createdFile.url.standardizedFileURL
+            })
+            files.append(createdFile)
+            installCached(files, for: zone)
+            presentRefreshFallback(error)
+        }
+    }
+
+    private func cachedFile(from sourceFile: ZoneStoredFile, at destination: URL) -> ZoneStoredFile {
+        var createdFile = sourceFile
+        createdFile.url = destination
+        createdFile.displayName = destination.lastPathComponent
+        return createdFile
+    }
+
     private func presentRefreshFallback(_ error: Error) {
         environment.presentError(
             "无法刷新分区",
@@ -1825,6 +1938,9 @@ final class WindowManager {
     var onChangeSortOrder: ((UUID, ZoneFileSortOrder) -> Void)?
     var onRenameFile: ((UUID, ZoneStoredFile, String) -> Result<URL, Error>)?
     var onTrashFile: ((UUID, URL) -> Void)?
+    var onDuplicateFile: ((UUID, ZoneStoredFile) -> Void)?
+    var onCompressFile: ((UUID, ZoneStoredFile) -> Void)?
+    var onMakeAliasFile: ((UUID, ZoneStoredFile) -> Void)?
     var onRefreshFiles: ((UUID) -> Void)?
     var onPresentFileError: ((String, String) -> Void)?
     var onValidateFile: ((UUID, URL) -> Bool)?
@@ -1860,6 +1976,30 @@ final class WindowManager {
                 return
             }
             self?.onTrashFile?(context.zoneID, url)
+        }
+        fileContextMenuController.onDuplicate = { [weak self] context in
+            guard let file = context.file else {
+                self?.onRefreshFiles?(context.zoneID)
+                self?.onPresentFileError?("项目已发生变化", "复制上下文已失效。")
+                return
+            }
+            self?.onDuplicateFile?(context.zoneID, file)
+        }
+        fileContextMenuController.onCompress = { [weak self] context in
+            guard let file = context.file else {
+                self?.onRefreshFiles?(context.zoneID)
+                self?.onPresentFileError?("项目已发生变化", "压缩上下文已失效。")
+                return
+            }
+            self?.onCompressFile?(context.zoneID, file)
+        }
+        fileContextMenuController.onMakeAlias = { [weak self] context in
+            guard let file = context.file else {
+                self?.onRefreshFiles?(context.zoneID)
+                self?.onPresentFileError?("项目已发生变化", "替身上下文已失效。")
+                return
+            }
+            self?.onMakeAliasFile?(context.zoneID, file)
         }
         fileContextMenuController.onRefresh = { [weak self] zoneID in
             self?.onRefreshFiles?(zoneID)
@@ -2093,6 +2233,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let configManager = ConfigManager()
     private let scanner = DesktopScanner()
     private let zoneLibrary = ZoneLibrary()
+    private let archiveCreator = DittoZoneArchiveCreator()
+    private let aliasCreator = FinderZoneAliasCreator()
     private let finderDefaults = UserDefaults(suiteName: "com.apple.finder")
     private var config: AppConfig!
     private var filesByZoneID: [UUID: [ZoneStoredFile]] = [:]
@@ -2119,6 +2261,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try zoneLibrary.renameStoredItem(at: url, to: name, in: zone)
             },
             trashItem: { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) },
+            duplicateItem: { [unowned self] url, zone in
+                try zoneLibrary.duplicateStoredItem(at: url, in: zone)
+            },
+            archiveDestination: { [unowned self] url, zone in
+                try zoneLibrary.archiveDestination(for: url, in: zone)
+            },
+            createArchive: { [unowned self] source, destination, completion in
+                archiveCreator.createArchive(
+                    from: source,
+                    to: destination,
+                    completion: completion
+                )
+            },
+            aliasDestination: { [unowned self] url, zone in
+                try zoneLibrary.aliasDestination(for: url, in: zone)
+            },
+            createAlias: { [unowned self] source, destination in
+                try aliasCreator.createAlias(from: source, to: destination)
+            },
             beginRenaming: { [unowned self] url, zoneID in
                 windowManager.selectAndRenameFile(at: url, in: zoneID)
             },
@@ -2218,6 +2379,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         windowManager.onTrashFile = { [weak self] zoneID, url in
             self?.trashStoredFile(url, in: zoneID)
+        }
+        windowManager.onDuplicateFile = { [weak self] zoneID, file in
+            self?.duplicateStoredFile(file, in: zoneID)
+        }
+        windowManager.onCompressFile = { [weak self] zoneID, file in
+            self?.compressStoredFile(file, in: zoneID)
+        }
+        windowManager.onMakeAliasFile = { [weak self] zoneID, file in
+            self?.makeAlias(for: file, in: zoneID)
         }
         windowManager.onRefreshFiles = { [weak self] zoneID in
             guard let self else { return }
@@ -2327,6 +2497,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func trashStoredFile(_ url: URL, in zoneID: UUID) {
         _ = fileOperationCoordinator.trash(url, in: zoneID)
+    }
+
+    private func duplicateStoredFile(_ file: ZoneStoredFile, in zoneID: UUID) {
+        _ = fileOperationCoordinator.duplicate(file, in: zoneID)
+    }
+
+    private func compressStoredFile(_ file: ZoneStoredFile, in zoneID: UUID) {
+        fileOperationCoordinator.compress(file, in: zoneID)
+    }
+
+    private func makeAlias(for file: ZoneStoredFile, in zoneID: UUID) {
+        _ = fileOperationCoordinator.makeAlias(file, in: zoneID)
     }
 
     @objc private func collectDesktopFiles() {

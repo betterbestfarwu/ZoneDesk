@@ -62,6 +62,9 @@ final class ZoneFileContextMenuController: NSObject {
     var onChangeSortOrder: ((UUID, ZoneFileSortOrder) -> Void)?
     var onRename: ((ZoneFileContext) -> Void)?
     var onTrash: ((ZoneFileContext) -> Void)?
+    var onDuplicate: ((ZoneFileContext) -> Void)?
+    var onCompress: ((ZoneFileContext) -> Void)?
+    var onMakeAlias: ((ZoneFileContext) -> Void)?
     var onRefresh: ((UUID) -> Void)?
     var onPresentError: ((String, String) -> Void)?
     var onValidateItem: ((UUID, URL) -> Bool)?
@@ -124,12 +127,14 @@ final class ZoneFileContextMenuController: NSObject {
             self?.open(file.url, in: context.zoneID)
         })
 
-        let openWithItem = NSMenuItem(title: "打开方式", action: nil, keyEquivalent: "")
-        openWithItem.submenu = systemServicesAvailable
-            ? openWithMenu(for: context)
-            : ZoneRetainingMenu(title: "打开方式")
-        openWithItem.isEnabled = systemServicesAvailable
-        menu.addItem(openWithItem)
+        if !file.isDirectory {
+            let openWithItem = NSMenuItem(title: "打开方式", action: nil, keyEquivalent: "")
+            openWithItem.submenu = systemServicesAvailable
+                ? openWithMenu(for: context)
+                : ZoneRetainingMenu(title: "打开方式")
+            openWithItem.isEnabled = systemServicesAvailable
+            menu.addItem(openWithItem)
+        }
         menu.addItem(.separator())
 
         menu.addItem(actionItem(title: "移到废纸篓", in: menu) { [weak self] _ in
@@ -146,13 +151,27 @@ final class ZoneFileContextMenuController: NSObject {
             guard self?.validate(context) == true else { return }
             self?.onRename?(context)
         })
+        menu.addItem(actionItem(title: "压缩“\(file.displayName)”", in: menu) { [weak self] _ in
+            guard self?.validate(context) == true else { return }
+            self?.onCompress?(context)
+        })
         menu.addItem(actionItem(title: "复制", in: menu) { [weak self] _ in
             guard self?.validate(context) == true else { return }
-            self?.copy(file.url)
+            self?.onDuplicate?(context)
+        })
+        menu.addItem(actionItem(title: "制作替身", in: menu) { [weak self] _ in
+            guard self?.validate(context) == true else { return }
+            self?.onMakeAlias?(context)
         })
         menu.addItem(actionItem(title: "快速查看", in: menu) { [weak self] _ in
             guard self?.validate(context) == true else { return }
             self?.quickLook(file.url, anchorView: context.anchorView)
+        })
+        menu.addItem(.separator())
+
+        menu.addItem(actionItem(title: "拷贝", in: menu) { [weak self] _ in
+            guard self?.validate(context) == true else { return }
+            self?.copy(file.url)
         })
 
         let shareItem = NSMenuItem(title: "共享", action: nil, keyEquivalent: "")
