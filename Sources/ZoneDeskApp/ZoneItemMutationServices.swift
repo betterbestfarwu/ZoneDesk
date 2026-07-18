@@ -9,6 +9,7 @@ protocol ZoneArchiveCreating {
     )
 }
 
+@MainActor
 protocol ZoneAliasCreating {
     func createAlias(from source: URL, to destination: URL) throws
 }
@@ -39,11 +40,6 @@ final class DittoZoneArchiveCreator: ZoneArchiveCreating {
 
     private let launch: Launcher
 
-    private struct ReservationIdentity {
-        let device: dev_t
-        let inode: ino_t
-    }
-
     init(launch: @escaping Launcher = DittoZoneArchiveCreator.launch) {
         self.launch = launch
     }
@@ -53,76 +49,52 @@ final class DittoZoneArchiveCreator: ZoneArchiveCreating {
         to destination: URL,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
-        let reservation: ReservationIdentity
+        let stagingDirectory: URL
         do {
-            reservation = try reserve(destination)
+            stagingDirectory = try ZoneMutationStaging.createDirectory(
+                in: destination.deletingLastPathComponent()
+            )
         } catch {
-            completion(.failure(error))
+            completion(.failure(ZoneItemMutationError.archiveFailed(error.localizedDescription)))
             return
         }
 
+        let stagedArchive = stagingDirectory.appendingPathComponent(
+            destination.lastPathComponent
+        )
+        let completionGate = ZoneMutationCompletionGate()
         launch(
             URL(fileURLWithPath: "/usr/bin/ditto"),
             [
                 "-c", "-k", "--sequesterRsrc", "--keepParent",
-                source.path, destination.path,
+                source.path, stagedArchive.path,
             ],
             { result in
-                if case .failure = result {
-                    Self.removeReservation(at: destination, matching: reservation)
+                guard completionGate.claim() else { return }
+                defer {
+                    ZoneMutationStaging.removeDirectory(stagingDirectory)
                 }
-                completion(result)
+
+                switch result {
+                case let .failure(error):
+                    completion(.failure(error))
+                case .success:
+                    do {
+                        try ZoneMutationStaging.publishNoReplace(
+                            stagedArchive,
+                            to: destination
+                        )
+                        completion(.success(()))
+                    } catch let error as ZoneItemMutationError {
+                        completion(.failure(error))
+                    } catch {
+                        completion(.failure(ZoneItemMutationError.archiveFailed(
+                            error.localizedDescription
+                        )))
+                    }
+                }
             }
         )
-    }
-
-    private func reserve(_ destination: URL) throws -> ReservationIdentity {
-        let fileDescriptor: Int32 = destination.withUnsafeFileSystemRepresentation { path in
-            guard let path else {
-                errno = EINVAL
-                return Int32(-1)
-            }
-            return Darwin.open(
-                path,
-                O_WRONLY | O_CREAT | O_EXCL,
-                S_IRUSR | S_IWUSR
-            )
-        }
-        guard fileDescriptor >= 0 else {
-            let errorCode = errno
-            if errorCode == EEXIST {
-                throw ZoneItemMutationError.destinationExists(destination)
-            }
-            throw ZoneItemMutationError.archiveFailed(
-                String(cString: strerror(errorCode))
-            )
-        }
-        defer { Darwin.close(fileDescriptor) }
-
-        var metadata = stat()
-        guard fstat(fileDescriptor, &metadata) == 0 else {
-            let details = String(cString: strerror(errno))
-            unlink(destination.path)
-            throw ZoneItemMutationError.archiveFailed(details)
-        }
-        return ReservationIdentity(device: metadata.st_dev, inode: metadata.st_ino)
-    }
-
-    private static func removeReservation(
-        at destination: URL,
-        matching reservation: ReservationIdentity
-    ) {
-        var metadata = stat()
-        let status: Int32 = destination.withUnsafeFileSystemRepresentation { path in
-            guard let path else { return Int32(-1) }
-            return lstat(path, &metadata)
-        }
-        guard status == 0,
-              metadata.st_dev == reservation.device,
-              metadata.st_ino == reservation.inode else {
-            return
-        }
-        try? FileManager.default.removeItem(at: destination)
     }
 
     private static func launch(
@@ -156,8 +128,9 @@ final class DittoZoneArchiveCreator: ZoneArchiveCreating {
     }
 }
 
+@MainActor
 final class FinderZoneAliasCreator: ZoneAliasCreating {
-    typealias ScriptExecutor = (String) -> NSDictionary?
+    typealias ScriptExecutor = @MainActor (String) -> NSDictionary?
 
     private let executeScript: ScriptExecutor
 
@@ -166,41 +139,51 @@ final class FinderZoneAliasCreator: ZoneAliasCreating {
     }
 
     func createAlias(from source: URL, to destination: URL) throws {
-        let sourceExpression = appleScriptStringExpression(source.path)
-        let parentExpression = appleScriptStringExpression(
-            destination.deletingLastPathComponent().path
+        let stagingDirectory: URL
+        do {
+            stagingDirectory = try ZoneMutationStaging.createDirectory(
+                in: destination.deletingLastPathComponent()
+            )
+        } catch {
+            throw ZoneItemMutationError.aliasFailed(error.localizedDescription)
+        }
+        defer {
+            ZoneMutationStaging.removeDirectory(stagingDirectory)
+        }
+
+        let stagedAlias = stagingDirectory.appendingPathComponent(
+            destination.lastPathComponent
         )
-        let nameExpression = appleScriptStringExpression(destination.lastPathComponent)
+        let sourceExpression = ZoneFileContextMenuController.appleScriptStringExpression(
+            source.path
+        )
+        let stagingExpression = ZoneFileContextMenuController.appleScriptStringExpression(
+            stagingDirectory.path
+        )
+        let nameExpression = ZoneFileContextMenuController.appleScriptStringExpression(
+            stagedAlias.lastPathComponent
+        )
         let script = """
         tell application "Finder"
-            set destinationFolder to (POSIX file (\(parentExpression)) as alias)
-            if exists item (\(nameExpression)) of destinationFolder then
-                error "目标已存在，未覆盖。" number -48
-            end if
+            set destinationFolder to (POSIX file (\(stagingExpression)) as alias)
             set sourceItem to (POSIX file (\(sourceExpression)) as alias)
             set createdAlias to make new alias file at destinationFolder to sourceItem
             set name of createdAlias to \(nameExpression)
         end tell
         """
 
-        guard let errorInfo = executeScript(script) else {
-            return
+        if let errorInfo = executeScript(script) {
+            let details = (errorInfo[NSAppleScript.errorMessage] as? String)
+                ?? "Finder 自动化请求被拒绝或执行失败。"
+            throw ZoneItemMutationError.aliasFailed(details)
         }
-        let details = (errorInfo[NSAppleScript.errorMessage] as? String)
-            ?? "Finder 自动化请求被拒绝或执行失败。"
-        throw ZoneItemMutationError.aliasFailed(details)
-    }
 
-    private func appleScriptStringExpression(_ value: String) -> String {
-        if Thread.isMainThread {
-            return MainActor.assumeIsolated {
-                ZoneFileContextMenuController.appleScriptStringExpression(value)
-            }
-        }
-        return DispatchQueue.main.sync {
-            MainActor.assumeIsolated {
-                ZoneFileContextMenuController.appleScriptStringExpression(value)
-            }
+        do {
+            try ZoneMutationStaging.publishNoReplace(stagedAlias, to: destination)
+        } catch let error as ZoneItemMutationError {
+            throw error
+        } catch {
+            throw ZoneItemMutationError.aliasFailed(error.localizedDescription)
         }
     }
 
@@ -211,5 +194,87 @@ final class FinderZoneAliasCreator: ZoneAliasCreating {
         var errorInfo: NSDictionary?
         _ = script.executeAndReturnError(&errorInfo)
         return errorInfo
+    }
+}
+
+private enum ZoneMutationStaging {
+    static func createDirectory(in parent: URL) throws -> URL {
+        let templatePath = parent.appendingPathComponent(
+            ".zonedesk-mutation-XXXXXX",
+            isDirectory: true
+        ).path
+        var template = templatePath.utf8CString
+        let directory = template.withUnsafeMutableBufferPointer { buffer -> URL? in
+            guard let baseAddress = buffer.baseAddress,
+                  let createdPath = Darwin.mkdtemp(baseAddress) else {
+                return nil
+            }
+            return URL(
+                fileURLWithFileSystemRepresentation: createdPath,
+                isDirectory: true,
+                relativeTo: nil
+            )
+        }
+        guard let directory else {
+            throw ZoneMutationStagingError.posix(errno)
+        }
+        return directory
+    }
+
+    static func publishNoReplace(_ source: URL, to destination: URL) throws {
+        let status: Int32 = source.withUnsafeFileSystemRepresentation { sourcePath in
+            guard let sourcePath else {
+                errno = EINVAL
+                return Int32(-1)
+            }
+            return destination.withUnsafeFileSystemRepresentation { destinationPath in
+                guard let destinationPath else {
+                    errno = EINVAL
+                    return Int32(-1)
+                }
+                return Darwin.renameatx_np(
+                    AT_FDCWD,
+                    sourcePath,
+                    AT_FDCWD,
+                    destinationPath,
+                    UInt32(RENAME_EXCL)
+                )
+            }
+        }
+        guard status == 0 else {
+            let errorCode = errno
+            if errorCode == EEXIST {
+                throw ZoneItemMutationError.destinationExists(destination)
+            }
+            throw ZoneMutationStagingError.posix(errorCode)
+        }
+    }
+
+    static func removeDirectory(_ directory: URL) {
+        try? FileManager.default.removeItem(at: directory)
+    }
+}
+
+private enum ZoneMutationStagingError: LocalizedError {
+    case posix(Int32)
+
+    var errorDescription: String? {
+        switch self {
+        case let .posix(errorCode):
+            return String(cString: strerror(errorCode))
+        }
+    }
+}
+
+private final class ZoneMutationCompletionGate {
+    private let lock = NSLock()
+    private var isClaimed = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClaimed else { return false }
+        isClaimed = true
+        return true
     }
 }
