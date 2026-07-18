@@ -248,6 +248,72 @@ struct ZoneFilesViewSelectionTests {
         #expect(harness.refreshAttempts == [harness.zone.id, harness.zone.id])
     }
 
+    @Test("duplicate scan failure caches the target with current sorting and preserves the source")
+    func duplicateScanFailureUsesCacheFallback() throws {
+        let harness = ZoneFileOperationHarness()
+        harness.scanError = OperationHarnessError.expected
+        harness.config.zones[0].fileSortOrder = .size
+        let currentZone = harness.config.zones[0]
+        let originalFiles = harness.filesByZoneID[harness.zone.id]!
+        let source = originalFiles[0]
+
+        let destination = try harness.coordinator.duplicate(source, in: harness.zone.id).get()
+        var expectedTarget = source
+        expectedTarget.url = destination
+        expectedTarget.displayName = destination.lastPathComponent
+
+        #expect(harness.installedZones.last == currentZone)
+        #expect(harness.filesByZoneID[harness.zone.id] == ZoneStoredFileSorter.sorted(
+            originalFiles + [expectedTarget],
+            by: .size
+        ))
+        #expect(harness.filesByZoneID[harness.zone.id]?.contains(source) == true)
+        #expect(expectedTarget.category == source.category)
+        #expect(expectedTarget.isDirectory == source.isDirectory)
+    }
+
+    @Test("alias scan failure caches only target-derived fields with current sorting")
+    func aliasScanFailureUsesMinimalCacheFallback() throws {
+        let harness = ZoneFileOperationHarness()
+        let source = ZoneStoredFile(
+            url: harness.directoryURL.appendingPathComponent("movie.mov"),
+            displayName: "movie.mov",
+            category: .video,
+            fileSize: 4_096,
+            lastOpenedDate: Date(timeIntervalSince1970: 1),
+            dateAdded: Date(timeIntervalSince1970: 2),
+            modificationDate: Date(timeIntervalSince1970: 3),
+            creationDate: Date(timeIntervalSince1970: 4),
+            tagNames: ["Favorite"]
+        )
+        let originalFiles = [source] + harness.filesByZoneID[harness.zone.id]!
+        harness.filesByZoneID[harness.zone.id] = originalFiles
+        harness.existingPaths.insert(source.url.standardizedFileURL)
+        harness.scanError = OperationHarnessError.expected
+        harness.config.zones[0].fileSortOrder = .size
+
+        let destination = try harness.coordinator.makeAlias(source, in: harness.zone.id).get()
+        let expectedTarget = ZoneStoredFile(
+            url: destination,
+            displayName: destination.lastPathComponent,
+            category: DesktopFileClassifier.classify(url: destination),
+            isDirectory: false
+        )
+
+        #expect(harness.filesByZoneID[harness.zone.id] == ZoneStoredFileSorter.sorted(
+            originalFiles + [expectedTarget],
+            by: .size
+        ))
+        #expect(harness.filesByZoneID[harness.zone.id]?.contains(source) == true)
+        #expect(expectedTarget.category == .other)
+        #expect(expectedTarget.fileSize == nil)
+        #expect(expectedTarget.lastOpenedDate == nil)
+        #expect(expectedTarget.dateAdded == nil)
+        #expect(expectedTarget.modificationDate == nil)
+        #expect(expectedTarget.creationDate == nil)
+        #expect(expectedTarget.tagNames.isEmpty)
+    }
+
     @Test("compression refreshes only after successful completion")
     func compressionCompletionCoordination() async {
         let harness = ZoneFileOperationHarness()
@@ -260,6 +326,55 @@ struct ZoneFilesViewSelectionTests {
         harness.archiveCompletion?(.success(()))
         await waitForMainQueue()
         #expect(harness.refreshAttempts == [harness.zone.id])
+    }
+
+    @Test("compression scan failure uses the current zone model and sorting")
+    func compressionScanFailureUsesCurrentZone() async {
+        let harness = ZoneFileOperationHarness()
+        harness.scanError = OperationHarnessError.expected
+        let originalFiles = harness.filesByZoneID[harness.zone.id]!
+        let source = originalFiles[0]
+
+        harness.coordinator.compress(source, in: harness.zone.id)
+        harness.config.zones[0].name = "Renamed Documents"
+        harness.config.zones[0].fileSortOrder = .size
+        let currentZone = harness.config.zones[0]
+
+        harness.archiveCompletion?(.success(()))
+        await waitForMainQueue()
+
+        let destination = harness.archivePairs[0].1
+        let expectedTarget = ZoneStoredFile(
+            url: destination,
+            displayName: destination.lastPathComponent,
+            category: .archive
+        )
+        #expect(harness.installedZones.last == currentZone)
+        #expect(harness.filesByZoneID[harness.zone.id] == ZoneStoredFileSorter.sorted(
+            originalFiles + [expectedTarget],
+            by: .size
+        ))
+        #expect(harness.filesByZoneID[harness.zone.id]?.contains(source) == true)
+        #expect(expectedTarget.category == .archive)
+        #expect(expectedTarget.isDirectory == false)
+    }
+
+    @Test("compression scan failure does not restore a deleted zone")
+    func compressionScanFailureDoesNotRestoreDeletedZone() async {
+        let harness = ZoneFileOperationHarness()
+        harness.scanError = OperationHarnessError.expected
+        let source = harness.filesByZoneID[harness.zone.id]![0]
+        let originalFiles = harness.filesByZoneID
+
+        harness.coordinator.compress(source, in: harness.zone.id)
+        harness.config.zones.removeAll()
+        harness.archiveCompletion?(.success(()))
+        await waitForMainQueue()
+
+        #expect(harness.installedZones.isEmpty)
+        #expect(harness.cachedFileRequests.isEmpty)
+        #expect(harness.filesByZoneID == originalFiles)
+        #expect(harness.presentedErrors.map(\.0) == ["无法刷新分区"])
     }
 
     @Test("stale mutation context does not invoke item services")
@@ -1181,6 +1296,7 @@ private final class ZoneFileOperationHarness {
     var aliasPairs: [(URL, URL)] = []
     var archiveCompletion: ((Result<Void, Error>) -> Void)?
     var refreshAttempts: [UUID] = []
+    var cachedFileRequests: [UUID] = []
     var presentedErrors: [(String, String)] = []
     var events: [String] = []
 
@@ -1190,7 +1306,10 @@ private final class ZoneFileOperationHarness {
             if let saveError { throw saveError }
         },
         applyConfig: { [unowned self] in config = $0 },
-        cachedFiles: { [unowned self] in filesByZoneID[$0] ?? [] },
+        cachedFiles: { [unowned self] zoneID in
+            cachedFileRequests.append(zoneID)
+            return filesByZoneID[zoneID] ?? []
+        },
         installFiles: { [unowned self] zone, files in
             events.append("install")
             installedZones.append(zone)

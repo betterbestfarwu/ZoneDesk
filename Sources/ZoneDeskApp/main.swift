@@ -1765,7 +1765,7 @@ final class ZoneFileOperationCoordinator {
             let destination = try environment.duplicateItem(sourceFile.url, zone)
             refreshAfterCreating(
                 cachedFile(from: sourceFile, at: destination),
-                in: zone
+                in: zone.id
             )
             return .success(destination)
         } catch {
@@ -1803,7 +1803,7 @@ final class ZoneFileOperationCoordinator {
                             displayName: destination.lastPathComponent,
                             category: .archive
                         ),
-                        in: zone
+                        in: zone.id
                     )
                 case let .failure(error):
                     self.environment.presentError("无法压缩项目", error.localizedDescription)
@@ -1826,9 +1826,13 @@ final class ZoneFileOperationCoordinator {
         do {
             let destination = try environment.aliasDestination(sourceFile.url, zone)
             try environment.createAlias(sourceFile.url, destination)
-            var alias = cachedFile(from: sourceFile, at: destination)
-            alias.isDirectory = false
-            refreshAfterCreating(alias, in: zone)
+            let alias = ZoneStoredFile(
+                url: destination,
+                displayName: destination.lastPathComponent,
+                category: DesktopFileClassifier.classify(url: destination),
+                isDirectory: false
+            )
+            refreshAfterCreating(alias, in: zone.id)
             return .success(destination)
         } catch {
             environment.presentError("无法制作替身", error.localizedDescription)
@@ -1890,17 +1894,23 @@ final class ZoneFileOperationCoordinator {
         )
     }
 
-    private func refreshAfterCreating(_ createdFile: ZoneStoredFile, in zone: ZoneModel) {
-        switch refresh(zoneID: zone.id) {
+    private func refreshAfterCreating(_ createdFile: ZoneStoredFile, in zoneID: UUID) {
+        switch refresh(zoneID: zoneID) {
         case .success:
             break
         case let .failure(error):
-            var files = environment.cachedFiles(zone.id)
+            guard let currentZone = environment.currentConfig().zones.first(where: {
+                $0.id == zoneID
+            }) else {
+                environment.presentError("无法刷新分区", error.localizedDescription)
+                return
+            }
+            var files = environment.cachedFiles(zoneID)
             files.removeAll(where: {
                 $0.url.standardizedFileURL == createdFile.url.standardizedFileURL
             })
             files.append(createdFile)
-            installCached(files, for: zone)
+            installCached(files, for: currentZone)
             presentRefreshFallback(error)
         }
     }
