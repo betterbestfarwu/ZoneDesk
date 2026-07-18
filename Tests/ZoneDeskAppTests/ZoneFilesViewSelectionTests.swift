@@ -1133,7 +1133,7 @@ struct ZoneFilesViewSelectionTests {
     }
 
     @Test("play button selects the video and routes only that click to Quick Look")
-    func playButtonClickRoutesQuickLook() throws {
+    func playButtonClickRoutesQuickLook() async throws {
         let provider = ImmediateThumbnailProvider()
         let fixture = try ZoneFilesViewFixture(fileCount: 0, thumbnailProvider: provider)
         let video = ZoneStoredFile(
@@ -1153,6 +1153,7 @@ struct ZoneFilesViewSelectionTests {
         fixture.view.quickLookPanelProvider = { panel }
 
         fixture.click(at: NSPoint(x: playFrame.midX, y: playFrame.midY))
+        await waitForMainQueue()
 
         #expect(fixture.view.selectedFileURL == video.url)
         #expect(panel.events.contains("reloadData"))
