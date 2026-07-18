@@ -492,6 +492,9 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
     var quickLookPanelProvider: () -> ZoneQuickLookPanelAdapting? = {
         QLPreviewPanel.shared()
     }
+    var quickLookApplicationActivator: () -> Void = {
+        NSApp.activate(ignoringOtherApps: true)
+    }
 
     var thumbnailProvider: ZoneFileThumbnailProviding = ZoneFileThumbnailProvider() {
         didSet {
@@ -760,20 +763,31 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
 
     func presentQuickLook(url: URL) {
         prepareQuickLook(url: url)
-        guard let window else {
+        guard let window,
+              let preparedDataSource = quickLookDataSource else {
             quickLookDataSource = nil
             onPresentError?("无法快速查看：分区窗口已关闭。")
             return
         }
 
-        window.makeFirstResponder(self)
-        window.makeKey()
-        guard let panel = quickLookPanelProvider() else {
-            quickLookDataSource = nil
-            onPresentError?("无法快速查看：快速查看面板不可用。")
-            return
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self,
+                  let window,
+                  self.window === window,
+                  self.quickLookDataSource === preparedDataSource else {
+                return
+            }
+
+            self.quickLookApplicationActivator()
+            window.makeFirstResponder(self)
+            window.makeKey()
+            guard let panel = self.quickLookPanelProvider() else {
+                self.quickLookDataSource = nil
+                self.onPresentError?("无法快速查看：快速查看面板不可用。")
+                return
+            }
+            _ = self.presentPreparedQuickLook(using: panel)
         }
-        _ = presentPreparedQuickLook(using: panel)
     }
 
     @discardableResult

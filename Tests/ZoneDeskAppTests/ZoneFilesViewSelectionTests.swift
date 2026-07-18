@@ -142,14 +142,40 @@ struct ZoneFilesViewSelectionTests {
         #expect(message == "无法获取快速查看控制权。")
     }
 
+    @Test("Quick Look waits for menu tracking to release panel control")
+    func quickLookWaitsForMenuTracking() async throws {
+        let fixture = try ZoneFilesViewFixture(fileCount: 1)
+        let panel = QuickLookPanelSpy(currentController: NSResponder())
+        var message: String?
+        fixture.view.quickLookPanelProvider = { panel }
+        fixture.view.onPresentError = { message = $0 }
+
+        DispatchQueue.main.async {
+            panel.currentController = fixture.view
+        }
+        fixture.view.presentQuickLook(url: fixture.files[0].url)
+        await waitForMainQueue()
+
+        #expect(message == nil)
+        #expect(panel.events == [
+            "updateController",
+            "currentController",
+            "setDataSource",
+            "setCurrentPreviewItemIndex:0",
+            "reloadData",
+            "show",
+        ])
+    }
+
     @Test("Quick Look reports an unavailable shared panel without crashing")
-    func quickLookHandlesUnavailablePanel() throws {
+    func quickLookHandlesUnavailablePanel() async throws {
         let fixture = try ZoneFilesViewFixture(fileCount: 1)
         var message: String?
         fixture.view.quickLookPanelProvider = { nil }
         fixture.view.onPresentError = { message = $0 }
 
         fixture.view.presentQuickLook(url: fixture.files[0].url)
+        await waitForMainQueue()
 
         #expect(fixture.view.quickLookDataSourceForTesting == nil)
         #expect(message == "无法快速查看：快速查看面板不可用。")
@@ -1014,12 +1040,12 @@ private enum OperationHarnessError: Error {
 
 @MainActor
 private final class QuickLookPanelSpy: ZoneQuickLookPanelAdapting {
-    private let controller: AnyObject
+    var currentController: AnyObject
     private(set) var events: [String] = []
     private(set) var dataSource: QLPreviewPanelDataSource?
 
     init(currentController: AnyObject) {
-        controller = currentController
+        self.currentController = currentController
     }
 
     func updateController() {
@@ -1028,7 +1054,7 @@ private final class QuickLookPanelSpy: ZoneQuickLookPanelAdapting {
 
     func hasCurrentController(_ candidate: AnyObject) -> Bool {
         events.append("currentController")
-        return controller === candidate
+        return currentController === candidate
     }
 
     func setDataSource(_ dataSource: QLPreviewPanelDataSource?) {
@@ -1336,6 +1362,7 @@ private final class ZoneFilesViewFixture {
         backingScaleFactor: CGFloat? = nil
     ) throws {
         view = ZoneFilesView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
+        view.quickLookApplicationActivator = {}
         if let thumbnailProvider {
             view.thumbnailProvider = thumbnailProvider
         }
