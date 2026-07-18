@@ -52,7 +52,7 @@ final class DittoZoneArchiveCreator: ZoneArchiveCreating {
         let stagingDirectory: URL
         do {
             stagingDirectory = try ZoneMutationStaging.createDirectory(
-                in: destination.deletingLastPathComponent()
+                in: destination.deletingLastPathComponent().deletingLastPathComponent()
             )
         } catch {
             completion(.failure(ZoneItemMutationError.archiveFailed(error.localizedDescription)))
@@ -142,7 +142,7 @@ final class FinderZoneAliasCreator: ZoneAliasCreating {
         let stagingDirectory: URL
         do {
             stagingDirectory = try ZoneMutationStaging.createDirectory(
-                in: destination.deletingLastPathComponent()
+                in: destination.deletingLastPathComponent().deletingLastPathComponent()
             )
         } catch {
             throw ZoneItemMutationError.aliasFailed(error.localizedDescription)

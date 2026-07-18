@@ -272,6 +272,24 @@ struct ZoneFilesViewSelectionTests {
         #expect(expectedTarget.isDirectory == source.isDirectory)
     }
 
+    @Test("scan failure refuses to cache a created URL that does not exist")
+    func scanFailureRejectsMissingCreatedURL() throws {
+        let harness = ZoneFileOperationHarness()
+        harness.scanError = OperationHarnessError.expected
+        harness.materializesDuplicate = false
+        let originalFiles = harness.filesByZoneID[harness.zone.id]!
+        let source = originalFiles[0]
+
+        let destination = try harness.coordinator.duplicate(source, in: harness.zone.id).get()
+
+        #expect(!harness.existingPaths.contains(destination.standardizedFileURL))
+        #expect(harness.installedZones.isEmpty)
+        #expect(harness.filesByZoneID[harness.zone.id] == originalFiles)
+        #expect(harness.presentedErrors.map(\.0) == ["无法刷新分区"])
+        #expect(harness.presentedErrors.first?.1.contains(destination.path) == true)
+        #expect(harness.presentedErrors.first?.1.contains("不存在") == true)
+    }
+
     @Test("alias scan failure caches only target-derived fields with current sorting")
     func aliasScanFailureUsesMinimalCacheFallback() throws {
         let harness = ZoneFileOperationHarness()
@@ -346,12 +364,14 @@ struct ZoneFilesViewSelectionTests {
         )
         harness.directoryURLOverrides[currentZone.name] = currentDirectory
 
-        harness.archiveCompletion?(.success(()))
-        await waitForMainQueue()
-
         let currentDestination = currentDirectory.standardizedFileURL
             .appendingPathComponent(launchedDestination.lastPathComponent)
             .standardizedFileURL
+        harness.existingPaths.insert(currentDestination)
+
+        harness.archiveCompletion?(.success(()))
+        await waitForMainQueue()
+
         let expectedTarget = ZoneStoredFile(
             url: currentDestination,
             displayName: currentDestination.lastPathComponent,
@@ -534,6 +554,8 @@ struct ZoneFilesViewSelectionTests {
         controller.sharingServicesProvider = { _ in [] }
         controller.pasteboardProvider = { pasteboard }
         controller.pasteboardURLWriter = { _, _ in false }
+        var presentedError: (String, String)?
+        controller.onPresentError = { presentedError = ($0, $1) }
 
         let menu = controller.menu(for: ZoneFileContext(
             zoneID: UUID(),
@@ -551,6 +573,8 @@ struct ZoneFilesViewSelectionTests {
         }
 
         #expect(pasteboard.string(forType: .string) == "keep me")
+        #expect(presentedError?.0 == "无法拷贝项目")
+        #expect(presentedError?.1 == "无法将该项目写入剪贴板。")
     }
 
     @Test("blank context menu clears selection and contains new folder and sorting")
@@ -1591,6 +1615,9 @@ private final class ZoneFileOperationHarness {
     var duplicateError: Error?
     var archiveDestinationError: Error?
     var aliasError: Error?
+    var materializesDuplicate = true
+    var materializesArchive = true
+    var materializesAlias = true
     var installedZones: [ZoneModel] = []
     var trashedURLs: [URL] = []
     var duplicatedURLs: [URL] = []
@@ -1639,7 +1666,11 @@ private final class ZoneFileOperationHarness {
         duplicateItem: { [unowned self] source, _ in
             if let duplicateError { throw duplicateError }
             duplicatedURLs.append(source)
-            return source.deletingLastPathComponent().appendingPathComponent("large copy")
+            let destination = source.deletingLastPathComponent().appendingPathComponent("large copy")
+            if materializesDuplicate {
+                existingPaths.insert(destination.standardizedFileURL)
+            }
+            return destination
         },
         archiveDestination: { [unowned self] source, _ in
             if let archiveDestinationError { throw archiveDestinationError }
@@ -1647,7 +1678,12 @@ private final class ZoneFileOperationHarness {
         },
         createArchive: { [unowned self] source, destination, completion in
             archivePairs.append((source, destination))
-            archiveCompletion = completion
+            archiveCompletion = { [unowned self] result in
+                if case .success = result, materializesArchive {
+                    existingPaths.insert(destination.standardizedFileURL)
+                }
+                completion(result)
+            }
         },
         aliasDestination: { source, _ in
             source.deletingLastPathComponent().appendingPathComponent("large alias")
@@ -1655,6 +1691,9 @@ private final class ZoneFileOperationHarness {
         createAlias: { [unowned self] source, destination in
             if let aliasError { throw aliasError }
             aliasPairs.append((source, destination))
+            if materializesAlias {
+                existingPaths.insert(destination.standardizedFileURL)
+            }
         },
         beginRenaming: { [unowned self] _, _ in
             events.append("rename")

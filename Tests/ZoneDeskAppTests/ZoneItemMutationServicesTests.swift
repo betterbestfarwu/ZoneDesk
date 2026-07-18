@@ -7,8 +7,9 @@ import Testing
 struct ZoneItemMutationServicesTests {
     @Test("archive creator launches ditto with the expected arguments")
     func archiveCreatorLaunchesDitto() throws {
-        let directory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
+        let library = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: library) }
+        let directory = try makeZoneDirectory(in: library)
         let source = URL(fileURLWithPath: "/tmp/source folder")
         let destination = directory.appendingPathComponent("archive.zip")
         var capturedExecutable: URL?
@@ -43,11 +44,11 @@ struct ZoneItemMutationServicesTests {
             "-c", "-k", "--sequesterRsrc", "--keepParent",
             source.path,
         ])
-        #expect(generatedArchive?.deletingLastPathComponent().deletingLastPathComponent() == directory)
+        #expect(generatedArchive?.deletingLastPathComponent().deletingLastPathComponent() == library)
         #expect(generatedArchive?.deletingLastPathComponent().lastPathComponent.hasPrefix(".zonedesk-mutation-") == true)
         #expect(privateDirectoryPermissions?.intValue == 0o700)
         #expect(try Data(contentsOf: destination) == Data("generated archive".utf8))
-        #expect(try temporaryMutationDirectories(in: directory).isEmpty)
+        #expect(try temporaryMutationDirectories(in: library).isEmpty)
         guard case .success? = archiveResult else {
             Issue.record("archive completion should succeed")
             return
@@ -56,8 +57,9 @@ struct ZoneItemMutationServicesTests {
 
     @Test("archive creator preserves launch failures")
     func archiveCreatorPreservesLaunchFailure() throws {
-        let directory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
+        let library = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: library) }
+        let directory = try makeZoneDirectory(in: library)
         let source = URL(fileURLWithPath: "/tmp/source")
         let destination = directory.appendingPathComponent("archive.zip")
         var archiveFailure: Result<Void, Error>?
@@ -76,8 +78,9 @@ struct ZoneItemMutationServicesTests {
 
     @Test("archive creator refuses an occupied destination without replacing it")
     func archiveCreatorRefusesOccupiedDestination() throws {
-        let directory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
+        let library = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: library) }
+        let directory = try makeZoneDirectory(in: library)
         let source = directory.appendingPathComponent("source")
         let destination = directory.appendingPathComponent("archive.zip")
         try Data("existing archive".utf8).write(to: destination)
@@ -100,13 +103,14 @@ struct ZoneItemMutationServicesTests {
             return
         }
         #expect(try Data(contentsOf: destination) == Data("existing archive".utf8))
-        #expect(try temporaryMutationDirectories(in: directory).isEmpty)
+        #expect(try temporaryMutationDirectories(in: library).isEmpty)
     }
 
     @Test("archive creator removes its private output after a launch failure")
     func archiveCreatorCleansUpFailedPrivateOutput() throws {
-        let directory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
+        let library = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: library) }
+        let directory = try makeZoneDirectory(in: library)
         let source = directory.appendingPathComponent("source")
         let destination = directory.appendingPathComponent("archive.zip")
         var generatedArchive: URL?
@@ -122,13 +126,80 @@ struct ZoneItemMutationServicesTests {
 
         #expect(generatedArchive?.deletingLastPathComponent().lastPathComponent.hasPrefix(".zonedesk-mutation-") == true)
         #expect(!FileManager.default.fileExists(atPath: destination.path))
-        #expect(try temporaryMutationDirectories(in: directory).isEmpty)
+        #expect(try temporaryMutationDirectories(in: library).isEmpty)
+    }
+
+    @Test("archive publication fails and cleans stable staging after the zone moves")
+    func archivePublicationFailsAfterZoneMoves() throws {
+        let library = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: library) }
+        let directory = try makeZoneDirectory(in: library)
+        let movedDirectory = library.appendingPathComponent("Moved Zone", isDirectory: true)
+
+        try assertArchivePublicationFailsAfterZoneMutation(
+            library: library,
+            directory: directory
+        ) {
+            try FileManager.default.moveItem(at: directory, to: movedDirectory)
+        }
+
+        #expect(try temporaryMutationDirectories(in: movedDirectory).isEmpty)
+    }
+
+    @Test("archive publication fails and cleans stable staging after the zone is deleted")
+    func archivePublicationFailsAfterZoneDeletion() throws {
+        let library = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: library) }
+        let directory = try makeZoneDirectory(in: library)
+
+        try assertArchivePublicationFailsAfterZoneMutation(
+            library: library,
+            directory: directory
+        ) {
+            try FileManager.default.removeItem(at: directory)
+        }
+    }
+
+    @Test("archive creator accepts only the first launcher completion")
+    func archiveCreatorCompletesOnceWithFirstResult() throws {
+        let library = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: library) }
+        let directory = try makeZoneDirectory(in: library)
+        let source = directory.appendingPathComponent("source")
+        let destination = directory.appendingPathComponent("archive.zip")
+        var completionCount = 0
+        var archiveResult: Result<Void, Error>?
+        let creator = DittoZoneArchiveCreator { _, arguments, completion in
+            do {
+                try Data("generated archive".utf8).write(
+                    to: URL(fileURLWithPath: try #require(arguments.last))
+                )
+                completion(.success(()))
+                completion(.failure(MutationServiceTestError.archiveFailed))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+
+        creator.createArchive(from: source, to: destination) { result in
+            completionCount += 1
+            archiveResult = result
+        }
+
+        #expect(completionCount == 1)
+        guard case .success? = archiveResult else {
+            Issue.record("archive completion should preserve the first successful result")
+            return
+        }
+        #expect(try Data(contentsOf: destination) == Data("generated archive".utf8))
+        #expect(try temporaryMutationDirectories(in: library).isEmpty)
     }
 
     @Test("archive publication collision preserves the winner and completes once")
     func archivePublicationCollisionIsNoReplace() throws {
-        let directory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
+        let library = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: library) }
+        let directory = try makeZoneDirectory(in: library)
         let source = directory.appendingPathComponent("source")
         let destination = directory.appendingPathComponent("archive.zip")
         var completionCount = 0
@@ -156,14 +227,14 @@ struct ZoneItemMutationServicesTests {
         }
         #expect(error is ZoneItemMutationError)
         #expect(try Data(contentsOf: destination) == Data("race winner".utf8))
-        #expect(try temporaryMutationDirectories(in: directory).isEmpty)
+        #expect(try temporaryMutationDirectories(in: library).isEmpty)
     }
 
     @Test("alias creator asks Finder to create an alias")
     func aliasCreatorUsesFinder() throws {
-        let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let directory = root.appendingPathComponent("target \\\"folder\nline", isDirectory: true)
+        let library = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: library) }
+        let directory = library.appendingPathComponent("target \\\"folder\nline", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         let item = URL(fileURLWithPath: "/tmp/source \\\"item\nline")
         let alias = directory.appendingPathComponent("source \\\"item alias\nline")
@@ -171,7 +242,7 @@ struct ZoneItemMutationServicesTests {
         var privateDirectory: URL?
         let aliasCreator = FinderZoneAliasCreator { scriptSource in
             capturedScript = scriptSource
-            let privateDirectories = try? temporaryMutationDirectories(in: directory)
+            let privateDirectories = try? temporaryMutationDirectories(in: library)
             privateDirectory = privateDirectories?.only
             if let privateDirectory {
                 try? Data("alias".utf8).write(
@@ -186,7 +257,7 @@ struct ZoneItemMutationServicesTests {
         #expect(capturedScript?.contains("tell application \"Finder\"") == true)
         #expect(capturedScript?.contains("make new alias file") == true)
         if let privateDirectory {
-            let scriptDirectory = directory.appendingPathComponent(
+            let scriptDirectory = library.appendingPathComponent(
                 privateDirectory.lastPathComponent,
                 isDirectory: true
             )
@@ -200,24 +271,26 @@ struct ZoneItemMutationServicesTests {
             #expect(capturedScript?.contains("set name of createdAlias to \(nameExpression)") == true)
         }
         #expect(FileManager.default.fileExists(atPath: alias.path))
-        #expect(try temporaryMutationDirectories(in: directory).isEmpty)
+        #expect(try temporaryMutationDirectories(in: library).isEmpty)
     }
 
     @Test("alias creator reports Finder automation errors")
     func aliasCreatorReportsFinderErrors() {
+        let library: URL
         let directory: URL
         do {
-            directory = try makeTemporaryDirectory()
+            library = try makeTemporaryDirectory()
+            directory = try makeZoneDirectory(in: library)
         } catch {
             Issue.record(error)
             return
         }
-        defer { try? FileManager.default.removeItem(at: directory) }
+        defer { try? FileManager.default.removeItem(at: library) }
         let item = directory.appendingPathComponent("source")
         let alias = directory.appendingPathComponent("source alias")
         var didCreatePrivateDirectory = false
         let deniedAliasCreator = FinderZoneAliasCreator { _ in
-            didCreatePrivateDirectory = (try? temporaryMutationDirectories(in: directory).count) == 1
+            didCreatePrivateDirectory = (try? temporaryMutationDirectories(in: library).count) == 1
             return [NSAppleScript.errorMessage: "automation denied"] as NSDictionary
         }
 
@@ -226,19 +299,20 @@ struct ZoneItemMutationServicesTests {
         }
         #expect(didCreatePrivateDirectory)
         #expect(!FileManager.default.fileExists(atPath: alias.path))
-        #expect((try? temporaryMutationDirectories(in: directory).isEmpty) == true)
+        #expect((try? temporaryMutationDirectories(in: library).isEmpty) == true)
     }
 
     @Test("alias publication collision preserves the winner and cleans private output")
     func aliasPublicationCollisionIsNoReplace() throws {
-        let directory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
+        let library = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: library) }
+        let directory = try makeZoneDirectory(in: library)
         let item = directory.appendingPathComponent("source")
         let alias = directory.appendingPathComponent("source alias")
         let aliasCreator = FinderZoneAliasCreator { _ in
             do {
                 let privateDirectory = try #require(
-                    temporaryMutationDirectories(in: directory).only
+                    temporaryMutationDirectories(in: library).only
                 )
                 try Data("generated alias".utf8).write(
                     to: privateDirectory.appendingPathComponent(alias.lastPathComponent)
@@ -254,8 +328,45 @@ struct ZoneItemMutationServicesTests {
             try aliasCreator.createAlias(from: item, to: alias)
         }
         #expect(try Data(contentsOf: alias) == Data("race winner".utf8))
-        #expect(try temporaryMutationDirectories(in: directory).isEmpty)
+        #expect(try temporaryMutationDirectories(in: library).isEmpty)
     }
+}
+
+private func assertArchivePublicationFailsAfterZoneMutation(
+    library: URL,
+    directory: URL,
+    mutateZone: () throws -> Void
+) throws {
+    let source = directory.appendingPathComponent("source")
+    let destination = directory.appendingPathComponent("archive.zip")
+    var launchCompletion: ((Result<Void, Error>) -> Void)?
+    var archiveResult: Result<Void, Error>?
+    let creator = DittoZoneArchiveCreator { _, arguments, completion in
+        guard let outputPath = arguments.last else {
+            completion(.failure(MutationServiceTestError.missingOutput))
+            return
+        }
+        do {
+            try Data("generated archive".utf8).write(
+                to: URL(fileURLWithPath: outputPath)
+            )
+            launchCompletion = completion
+        } catch {
+            completion(.failure(error))
+        }
+    }
+
+    creator.createArchive(from: source, to: destination) { archiveResult = $0 }
+    #expect(try temporaryMutationDirectories(in: library).count == 1)
+    try mutateZone()
+    launchCompletion?(.success(()))
+
+    guard case .failure? = archiveResult else {
+        Issue.record("publishing to a moved or deleted zone should fail")
+        return
+    }
+    #expect(!FileManager.default.fileExists(atPath: destination.path))
+    #expect(try temporaryMutationDirectories(in: library).isEmpty)
 }
 
 private enum MutationServiceTestError: LocalizedError {
@@ -273,6 +384,15 @@ private enum MutationServiceTestError: LocalizedError {
 private func makeTemporaryDirectory() throws -> URL {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: false
+    )
+    return directory
+}
+
+private func makeZoneDirectory(in library: URL) throws -> URL {
+    let directory = library.appendingPathComponent("Zone", isDirectory: true)
     try FileManager.default.createDirectory(
         at: directory,
         withIntermediateDirectories: false

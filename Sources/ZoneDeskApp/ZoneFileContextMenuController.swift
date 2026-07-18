@@ -326,7 +326,7 @@ final class ZoneFileContextMenuController: NSObject {
         pasteboard.clearContents()
         guard pasteboardURLWriter(pasteboard, url) else {
             snapshot.restore(to: pasteboard)
-            onPresentError?("无法复制项目", "无法将该项目写入剪贴板。")
+            onPresentError?("无法拷贝项目", "无法将该项目写入剪贴板。")
             return
         }
     }

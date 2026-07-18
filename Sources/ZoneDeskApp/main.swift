@@ -1755,6 +1755,8 @@ private enum ZoneFileOperationError: LocalizedError {
     case itemOutsideZone(URL)
     case refreshFailed(Error)
     case renameTargetUnavailable(URL)
+    case unsafeCreatedItemURL(URL)
+    case missingCreatedItem(URL)
 
     var errorDescription: String? {
         switch self {
@@ -1770,6 +1772,10 @@ private enum ZoneFileOperationError: LocalizedError {
             return error.localizedDescription
         case let .renameTargetUnavailable(url):
             return "无法在刷新后找到项目：\(url.lastPathComponent)"
+        case let .unsafeCreatedItemURL(url):
+            return "无法安全映射新项目到当前分区目录：\(url.path)"
+        case let .missingCreatedItem(url):
+            return "映射后的新项目不存在：\(url.path)"
         }
     }
 }
@@ -2115,13 +2121,16 @@ final class ZoneFileOperationCoordinator {
                 environment.presentError("无法刷新分区", error.localizedDescription)
                 return
             }
-            guard let currentCreatedFile = remappedCachedFile(
-                createdFile,
-                for: currentZone
-            ) else {
+            let currentCreatedFile: ZoneStoredFile
+            do {
+                currentCreatedFile = try remappedCachedFile(
+                    createdFile,
+                    for: currentZone
+                )
+            } catch let mappingError {
                 environment.presentError(
                     "无法刷新分区",
-                    "\(error.localizedDescription) 无法安全映射新项目到当前分区目录，已跳过缓存插入。"
+                    "\(error.localizedDescription) \(mappingError.localizedDescription)，已跳过缓存插入。"
                 )
                 return
             }
@@ -2138,7 +2147,7 @@ final class ZoneFileOperationCoordinator {
     private func remappedCachedFile(
         _ createdFile: ZoneStoredFile,
         for zone: ZoneModel
-    ) -> ZoneStoredFile? {
+    ) throws -> ZoneStoredFile {
         let directory = environment.directoryURL(zone).standardizedFileURL
         let name = createdFile.url.lastPathComponent
         guard directory.isFileURL,
@@ -2148,14 +2157,17 @@ final class ZoneFileOperationCoordinator {
               name != ".",
               name != ".."
         else {
-            return nil
+            throw ZoneFileOperationError.unsafeCreatedItemURL(createdFile.url)
         }
 
         let currentURL = directory
             .appendingPathComponent(name, isDirectory: createdFile.isDirectory)
             .standardizedFileURL
         guard currentURL.deletingLastPathComponent() == directory else {
-            return nil
+            throw ZoneFileOperationError.unsafeCreatedItemURL(currentURL)
+        }
+        guard environment.fileExists(currentURL) else {
+            throw ZoneFileOperationError.missingCreatedItem(currentURL)
         }
 
         var currentCreatedFile = createdFile

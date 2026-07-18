@@ -11,6 +11,13 @@ struct ZoneLibraryTests {
         let zone = fixture.zone(name: "资料", categories: [.other])
         let report = try fixture.writeZoneFile(named: "report.pdf", in: zone)
         let folder = try fixture.library.createFolder(in: zone, preferredName: "Folder")
+        let nestedDirectory = folder.appendingPathComponent("Nested", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: nestedDirectory,
+            withIntermediateDirectories: false
+        )
+        let nestedFile = nestedDirectory.appendingPathComponent("details.txt")
+        try Data("nested fixture".utf8).write(to: nestedFile)
         _ = try fixture.writeZoneFile(named: "report 副本.pdf", in: zone)
         _ = try fixture.writeZoneFile(named: "Folder.zip", in: zone)
         _ = try fixture.writeZoneFile(named: "Folder 的替身", in: zone)
@@ -22,6 +29,10 @@ struct ZoneLibraryTests {
         #expect(try String(contentsOf: fileCopy) == "fixture")
         #expect(folderCopy.lastPathComponent == "Folder 副本")
         #expect(FileManager.default.fileExists(atPath: folderCopy.path))
+        #expect(
+            try String(contentsOf: folderCopy.appendingPathComponent("Nested/details.txt"))
+                == "nested fixture"
+        )
         #expect(
             try fixture.library.archiveDestination(for: folder, in: zone).lastPathComponent
                 == "Folder 2.zip"
