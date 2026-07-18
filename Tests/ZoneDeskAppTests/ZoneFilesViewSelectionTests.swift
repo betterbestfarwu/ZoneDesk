@@ -88,7 +88,7 @@ struct ZoneFilesViewSelectionTests {
         var refreshCount = 0
         var message: String?
         fixture.view.onRefreshFiles = { _ in refreshCount += 1 }
-        fixture.view.onPresentError = { message = $0 }
+        fixture.view.onPresentError = { _, details in message = details }
         #expect(!fixture.view.beginRenaming(url: URL(fileURLWithPath: "/missing.pdf")))
         #expect(refreshCount == 1)
         #expect(message != nil)
@@ -132,7 +132,7 @@ struct ZoneFilesViewSelectionTests {
         let view = ZoneFilesView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
         let panel = QuickLookPanelSpy(currentController: NSResponder())
         var message: String?
-        view.onPresentError = { message = $0 }
+        view.onPresentError = { _, details in message = details }
         view.prepareQuickLook(url: URL(fileURLWithPath: "/tmp/preview.pdf"))
 
         #expect(!view.presentPreparedQuickLook(using: panel))
@@ -148,7 +148,7 @@ struct ZoneFilesViewSelectionTests {
         let panel = QuickLookPanelSpy(currentController: NSResponder())
         var message: String?
         fixture.view.quickLookPanelProvider = { panel }
-        fixture.view.onPresentError = { message = $0 }
+        fixture.view.onPresentError = { _, details in message = details }
 
         DispatchQueue.main.async {
             panel.currentController = fixture.view
@@ -167,18 +167,54 @@ struct ZoneFilesViewSelectionTests {
         ])
     }
 
+    @Test("Quick Look retries while the active window is still taking panel control")
+    func quickLookRetriesDelayedControllerHandoff() async throws {
+        let fixture = try ZoneFilesViewFixture(fileCount: 1)
+        let panel = QuickLookPanelSpy(currentController: NSResponder())
+        var message: String?
+        fixture.view.quickLookPanelProvider = { panel }
+        fixture.view.onPresentError = { _, details in message = details }
+        panel.onUpdateController = { updateCount in
+            if updateCount == 2 {
+                panel.currentController = fixture.view
+            }
+        }
+
+        fixture.view.presentQuickLook(url: fixture.files[0].url)
+        await waitForMainQueue()
+        await waitForMainQueue()
+
+        #expect(message == nil)
+        #expect(panel.events.filter { $0 == "updateController" }.count == 2)
+        #expect(panel.events.contains("reloadData"))
+        #expect(panel.events.contains("show"))
+    }
+
     @Test("Quick Look reports an unavailable shared panel without crashing")
     func quickLookHandlesUnavailablePanel() async throws {
         let fixture = try ZoneFilesViewFixture(fileCount: 1)
         var message: String?
         fixture.view.quickLookPanelProvider = { nil }
-        fixture.view.onPresentError = { message = $0 }
+        fixture.view.onPresentError = { _, details in message = details }
 
         fixture.view.presentQuickLook(url: fixture.files[0].url)
         await waitForMainQueue()
 
         #expect(fixture.view.quickLookDataSourceForTesting == nil)
-        #expect(message == "无法快速查看：快速查看面板不可用。")
+        #expect(message == "快速查看面板不可用。")
+    }
+
+    @Test("Quick Look errors identify the failed operation")
+    func quickLookErrorUsesQuickLookTitle() async throws {
+        let fixture = try ZoneFilesViewFixture(fileCount: 1)
+        var title: String?
+        fixture.view.quickLookPanelProvider = { nil }
+        fixture.view.onPresentError = { title = $0; _ = $1 }
+
+        fixture.view.presentQuickLook(url: fixture.files[0].url)
+        await waitForMainQueue()
+
+        #expect(title == "无法快速查看")
     }
 
     @Test("WindowManager routes menu actions with the captured zone identifier")
@@ -1209,7 +1245,7 @@ struct ZoneFilesViewSelectionTests {
         let fixture = try ZoneFilesViewFixture(fileCount: 1)
         var presentedMessage: String?
         fixture.view.onRenameFile = { _, _ in .failure(RenameTestError.rejected) }
-        fixture.view.onPresentError = { presentedMessage = $0 }
+        fixture.view.onPresentError = { _, details in presentedMessage = details }
         fixture.view.beginRenaming(url: fixture.files[0].url)
         fixture.view.renameEditorStringValue = "rejected.pdf"
 
@@ -1322,7 +1358,7 @@ struct ZoneFilesViewSelectionTests {
         let fixture = try ZoneFilesViewFixture(fileCount: 1)
         var presentedMessage: String?
         fixture.view.onRenameFile = { _, _ in .failure(RenameTestError.rejected) }
-        fixture.view.onPresentError = { presentedMessage = $0 }
+        fixture.view.onPresentError = { _, details in presentedMessage = details }
         fixture.view.beginRenaming(url: fixture.files[0].url)
         let editor = try #require(fixture.renameField)
         fixture.view.renameEditorStringValue = "rejected.pdf"
@@ -1344,7 +1380,7 @@ struct ZoneFilesViewSelectionTests {
             callbackCount += 1
             return .success(file.url)
         }
-        fixture.view.onPresentError = { presentedMessage = $0 }
+        fixture.view.onPresentError = { _, details in presentedMessage = details }
         fixture.view.beginRenaming(url: fixture.files[0].url)
         let editor = try #require(fixture.renameField)
         fixture.view.renameEditorStringValue = "../outside"
@@ -1583,6 +1619,7 @@ private enum OperationHarnessError: Error {
 @MainActor
 private final class QuickLookPanelSpy: ZoneQuickLookPanelAdapting {
     var currentController: AnyObject
+    var onUpdateController: ((Int) -> Void)?
     private(set) var events: [String] = []
     private(set) var dataSource: QLPreviewPanelDataSource?
 
@@ -1592,6 +1629,7 @@ private final class QuickLookPanelSpy: ZoneQuickLookPanelAdapting {
 
     func updateController() {
         events.append("updateController")
+        onUpdateController?(events.filter { $0 == "updateController" }.count)
     }
 
     func hasCurrentController(_ candidate: AnyObject) -> Bool {
@@ -2001,6 +2039,7 @@ private final class ZoneFilesViewFixture {
     ) throws {
         view = ZoneFilesView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
         view.quickLookApplicationActivator = {}
+        view.quickLookControlRetryDelay = 0
         if let thumbnailProvider {
             view.thumbnailProvider = thumbnailProvider
         }

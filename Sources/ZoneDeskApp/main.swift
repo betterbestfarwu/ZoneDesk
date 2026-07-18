@@ -159,7 +159,7 @@ final class ZoneWindow: NSWindow {
         get { zoneView.onRenameFile }
         set { zoneView.onRenameFile = newValue }
     }
-    var onPresentFileError: ((String) -> Void)? {
+    var onPresentFileError: ((String, String) -> Void)? {
         get { zoneView.onPresentFileError }
         set { zoneView.onPresentFileError = newValue }
     }
@@ -465,6 +465,8 @@ extension QLPreviewPanel: ZoneQuickLookPanelAdapting {
 
 @MainActor
 final class ZoneFilesView: NSView, NSTextFieldDelegate {
+    private static let quickLookControlAttemptLimit = 10
+
     private struct Cell {
         var file: ZoneStoredFile
         var frame: NSRect
@@ -499,6 +501,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
     var quickLookApplicationActivator: () -> Void = {
         NSApp.activate(ignoringOtherApps: true)
     }
+    var quickLookControlRetryDelay: TimeInterval = 0.05
 
     var thumbnailProvider: ZoneFileThumbnailProviding = ZoneFileThumbnailProvider() {
         didSet {
@@ -519,7 +522,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
 
     var onOpenFile: ((URL) -> Void)?
     var onRenameFile: ((ZoneStoredFile, String) -> Result<URL, Error>)?
-    var onPresentError: ((String) -> Void)?
+    var onPresentError: ((String, String) -> Void)?
     var onRefreshFiles: ((UUID) -> Void)?
 
     var quickLookDataSourceForTesting: ZoneQuickLookDataSource? {
@@ -831,7 +834,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         layoutSubtreeIfNeeded()
         guard let cell = cells.first(where: { $0.file.url == url }) else {
             onRefreshFiles?(zoneID)
-            onPresentError?("项目已移动或删除，已请求刷新分区。")
+            onPresentError?("无法重新命名", "项目已移动或删除，已请求刷新分区。")
             return false
         }
 
@@ -883,7 +886,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         guard let window,
               let preparedDataSource = quickLookDataSource else {
             quickLookDataSource = nil
-            onPresentError?("无法快速查看：分区窗口已关闭。")
+            onPresentError?("无法快速查看", "分区窗口已关闭。")
             return
         }
 
@@ -900,10 +903,49 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
             window.makeKey()
             guard let panel = self.quickLookPanelProvider() else {
                 self.quickLookDataSource = nil
-                self.onPresentError?("无法快速查看：快速查看面板不可用。")
+                self.onPresentError?("无法快速查看", "快速查看面板不可用。")
                 return
             }
-            _ = self.presentPreparedQuickLook(using: panel)
+            self.acquireQuickLookControl(
+                using: panel,
+                dataSource: preparedDataSource,
+                window: window,
+                remainingAttempts: Self.quickLookControlAttemptLimit
+            )
+        }
+    }
+
+    private func acquireQuickLookControl(
+        using panel: ZoneQuickLookPanelAdapting,
+        dataSource: ZoneQuickLookDataSource,
+        window: NSWindow,
+        remainingAttempts: Int
+    ) {
+        guard self.window === window,
+              quickLookDataSource === dataSource else {
+            return
+        }
+
+        panel.updateController()
+        if panel.hasCurrentController(self) {
+            configureQuickLookPanel(panel)
+            panel.show()
+            return
+        }
+
+        guard remainingAttempts > 1 else {
+            quickLookDataSource = nil
+            onPresentError?("无法快速查看", "无法获取快速查看控制权。")
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + quickLookControlRetryDelay) { [weak self] in
+            self?.acquireQuickLookControl(
+                using: panel,
+                dataSource: dataSource,
+                window: window,
+                remainingAttempts: remainingAttempts - 1
+            )
         }
     }
 
@@ -912,7 +954,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         panel.updateController()
         guard panel.hasCurrentController(self) else {
             quickLookDataSource = nil
-            onPresentError?("无法获取快速查看控制权。")
+            onPresentError?("无法快速查看", "无法获取快速查看控制权。")
             return false
         }
         configureQuickLookPanel(panel)
@@ -1048,7 +1090,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         guard editor === renameEditor else {
             return
         }
-        onPresentError?(error.localizedDescription)
+        onPresentError?("无法重新命名", error.localizedDescription)
         window?.makeFirstResponder(editor)
         DispatchQueue.main.async { [weak self, weak editor] in
             guard let self,
@@ -1436,7 +1478,7 @@ final class ZoneView: NSView {
         get { filesView.onRenameFile }
         set { filesView.onRenameFile = newValue }
     }
-    var onPresentFileError: ((String) -> Void)? {
+    var onPresentFileError: ((String, String) -> Void)? {
         get { filesView.onPresentError }
         set { filesView.onPresentError = newValue }
     }
@@ -2318,8 +2360,8 @@ final class WindowManager {
                 }
                 return onRenameFile(zone.id, file, name)
             }
-            window.onPresentFileError = { [weak self] details in
-                self?.onPresentFileError?("无法重新命名", details)
+            window.onPresentFileError = { [weak self] message, details in
+                self?.onPresentFileError?(message, details)
             }
             window.onRefreshFiles = { [weak self] zoneID in
                 self?.onRefreshFiles?(zoneID)
