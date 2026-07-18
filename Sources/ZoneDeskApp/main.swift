@@ -1905,14 +1905,53 @@ final class ZoneFileOperationCoordinator {
                 environment.presentError("无法刷新分区", error.localizedDescription)
                 return
             }
+            guard let currentCreatedFile = remappedCachedFile(
+                createdFile,
+                for: currentZone
+            ) else {
+                environment.presentError(
+                    "无法刷新分区",
+                    "\(error.localizedDescription) 无法安全映射新项目到当前分区目录，已跳过缓存插入。"
+                )
+                return
+            }
             var files = environment.cachedFiles(zoneID)
             files.removeAll(where: {
-                $0.url.standardizedFileURL == createdFile.url.standardizedFileURL
+                $0.url.standardizedFileURL == currentCreatedFile.url
             })
-            files.append(createdFile)
+            files.append(currentCreatedFile)
             installCached(files, for: currentZone)
             presentRefreshFallback(error)
         }
+    }
+
+    private func remappedCachedFile(
+        _ createdFile: ZoneStoredFile,
+        for zone: ZoneModel
+    ) -> ZoneStoredFile? {
+        let directory = environment.directoryURL(zone).standardizedFileURL
+        let name = createdFile.url.lastPathComponent
+        guard directory.isFileURL,
+              createdFile.url.isFileURL,
+              !name.isEmpty,
+              name != "/",
+              name != ".",
+              name != ".."
+        else {
+            return nil
+        }
+
+        let currentURL = directory
+            .appendingPathComponent(name, isDirectory: createdFile.isDirectory)
+            .standardizedFileURL
+        guard currentURL.deletingLastPathComponent() == directory else {
+            return nil
+        }
+
+        var currentCreatedFile = createdFile
+        currentCreatedFile.url = currentURL
+        currentCreatedFile.displayName = currentURL.lastPathComponent
+        return currentCreatedFile
     }
 
     private func cachedFile(from sourceFile: ZoneStoredFile, at destination: URL) -> ZoneStoredFile {

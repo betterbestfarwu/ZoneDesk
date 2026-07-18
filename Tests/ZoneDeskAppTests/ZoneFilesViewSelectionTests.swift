@@ -328,35 +328,69 @@ struct ZoneFilesViewSelectionTests {
         #expect(harness.refreshAttempts == [harness.zone.id])
     }
 
-    @Test("compression scan failure uses the current zone model and sorting")
-    func compressionScanFailureUsesCurrentZone() async {
+    @Test("compression scan failure remaps the target into the renamed zone directory")
+    func compressionScanFailureUsesCurrentZoneDirectory() async {
         let harness = ZoneFileOperationHarness()
         harness.scanError = OperationHarnessError.expected
         let originalFiles = harness.filesByZoneID[harness.zone.id]!
         let source = originalFiles[0]
 
         harness.coordinator.compress(source, in: harness.zone.id)
+        let launchedDestination = harness.archivePairs[0].1
         harness.config.zones[0].name = "Renamed Documents"
         harness.config.zones[0].fileSortOrder = .size
         let currentZone = harness.config.zones[0]
+        let currentDirectory = URL(
+            fileURLWithPath: "/library/Relocated/../Renamed Documents",
+            isDirectory: true
+        )
+        harness.directoryURLOverrides[currentZone.name] = currentDirectory
 
         harness.archiveCompletion?(.success(()))
         await waitForMainQueue()
 
-        let destination = harness.archivePairs[0].1
+        let currentDestination = currentDirectory.standardizedFileURL
+            .appendingPathComponent(launchedDestination.lastPathComponent)
+            .standardizedFileURL
         let expectedTarget = ZoneStoredFile(
-            url: destination,
-            displayName: destination.lastPathComponent,
+            url: currentDestination,
+            displayName: currentDestination.lastPathComponent,
             category: .archive
         )
+        #expect(launchedDestination.standardizedFileURL != currentDestination)
         #expect(harness.installedZones.last == currentZone)
         #expect(harness.filesByZoneID[harness.zone.id] == ZoneStoredFileSorter.sorted(
             originalFiles + [expectedTarget],
             by: .size
         ))
+        #expect(harness.filesByZoneID[harness.zone.id]?.last?.url == currentDestination)
+        #expect(currentDestination.deletingLastPathComponent() == currentDirectory.standardizedFileURL)
         #expect(harness.filesByZoneID[harness.zone.id]?.contains(source) == true)
         #expect(expectedTarget.category == .archive)
         #expect(expectedTarget.isDirectory == false)
+    }
+
+    @Test("compression scan failure skips cache insertion when the current directory is unsafe")
+    func compressionScanFailureRejectsUnsafeCurrentDirectory() async {
+        let harness = ZoneFileOperationHarness()
+        harness.scanError = OperationHarnessError.expected
+        let source = harness.filesByZoneID[harness.zone.id]![0]
+        let originalFiles = harness.filesByZoneID
+
+        harness.coordinator.compress(source, in: harness.zone.id)
+        harness.config.zones[0].name = "Remote Documents"
+        harness.directoryURLOverrides["Remote Documents"] = URL(
+            string: "https://example.com/library"
+        )!
+
+        harness.archiveCompletion?(.success(()))
+        await waitForMainQueue()
+
+        #expect(harness.installedZones.isEmpty)
+        #expect(harness.cachedFileRequests.isEmpty)
+        #expect(harness.filesByZoneID == originalFiles)
+        #expect(harness.presentedErrors.map(\.0) == ["无法刷新分区"])
+        #expect(harness.presentedErrors.first?.1.contains("无法安全映射") == true)
     }
 
     @Test("compression scan failure does not restore a deleted zone")
@@ -1279,8 +1313,10 @@ private final class ZoneFileOperationHarness {
         acceptedCategories: [.document],
         locked: false
     )
-    let directoryURL = URL(fileURLWithPath: "/library/Documents", isDirectory: true)
-    let createdURL = URL(fileURLWithPath: "/library/Documents/New Folder", isDirectory: true)
+    let libraryURL = URL(fileURLWithPath: "/library", isDirectory: true)
+    var directoryURLOverrides: [String: URL] = [:]
+    var directoryURL: URL { directoryURL(for: zone) }
+    var createdURL: URL { directoryURL.appendingPathComponent("New Folder", isDirectory: true) }
     var config: AppConfig
     var filesByZoneID: [UUID: [ZoneStoredFile]]
     var existingPaths: Set<URL>
@@ -1320,7 +1356,7 @@ private final class ZoneFileOperationHarness {
             if let scanError { throw scanError }
             return filesByZoneID[zone.id] ?? []
         },
-        directoryURL: { [unowned self] _ in directoryURL },
+        directoryURL: { [unowned self] in directoryURL(for: $0) },
         fileExists: { [unowned self] in existingPaths.contains($0.standardizedFileURL) },
         createFolder: { [unowned self] _ in
             events.append("create")
@@ -1364,22 +1400,31 @@ private final class ZoneFileOperationHarness {
 
     init() {
         config = AppConfig(zones: [zone])
+        let initialDirectoryURL = URL(
+            fileURLWithPath: "/library/Documents",
+            isDirectory: true
+        )
         let files = [
             ZoneStoredFile(
-                url: directoryURL.appendingPathComponent("large"),
+                url: initialDirectoryURL.appendingPathComponent("large"),
                 displayName: "large",
                 category: .document,
                 fileSize: 20
             ),
             ZoneStoredFile(
-                url: directoryURL.appendingPathComponent("small"),
+                url: initialDirectoryURL.appendingPathComponent("small"),
                 displayName: "small",
                 category: .document,
                 fileSize: 10
             ),
         ]
         filesByZoneID = [zone.id: files]
-        existingPaths = Set(([directoryURL] + files.map(\.url)).map(\.standardizedFileURL))
+        existingPaths = Set(([initialDirectoryURL] + files.map(\.url)).map(\.standardizedFileURL))
+    }
+
+    func directoryURL(for zone: ZoneModel) -> URL {
+        directoryURLOverrides[zone.name]
+            ?? libraryURL.appendingPathComponent(zone.name, isDirectory: true)
     }
 }
 
