@@ -480,6 +480,10 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
     private var cells: [Cell] = []
     private var fileLayout = FinderDesktopIconLayout.finderDefault
     private var thumbnailGeneration = 0
+    private var videoTrackingArea: NSTrackingArea?
+    private weak var observedClipView: NSClipView?
+    private var hoveredVideoURL: URL?
+    private var lastHoverPoint: NSPoint?
     private var renameEditor: NSTextField?
     private var renamingFileURL: URL?
     private var renamingFileSnapshot: ZoneStoredFile?
@@ -504,6 +508,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
                 cells[index].thumbnailRequestKey = nil
             }
             requestThumbnails()
+            reconcileHoveredVideo()
             needsDisplay = true
         }
     }
@@ -519,6 +524,10 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
 
     var quickLookDataSourceForTesting: ZoneQuickLookDataSource? {
         quickLookDataSource
+    }
+
+    var hoveredVideoURLForTesting: URL? {
+        hoveredVideoURL
     }
 
     var isRenamingFile: Bool {
@@ -555,6 +564,12 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
             cancelRenaming()
         }
         thumbnailGeneration &+= 1
+        if let hoveredVideoURL,
+           !files.contains(where: {
+               $0.url == hoveredVideoURL && $0.category == .video && !$0.isDirectory
+           }) {
+            setHoveredVideoURL(nil)
+        }
         self.files = files
         cells = []
         fileLayout = layout
@@ -572,10 +587,77 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         true
     }
 
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+
+        if let observedClipView {
+            NotificationCenter.default.removeObserver(
+                self,
+                name: NSView.boundsDidChangeNotification,
+                object: observedClipView
+            )
+        }
+        observedClipView = enclosingScrollView?.contentView
+        guard let observedClipView else {
+            return
+        }
+        observedClipView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(clipViewBoundsDidChange(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: observedClipView
+        )
+    }
+
     override func layout() {
         super.layout()
         rebuildCells()
+        reconcileHoveredVideo()
         updateRenameEditorFrame()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        if let videoTrackingArea {
+            removeTrackingArea(videoTrackingArea)
+        }
+
+        let trackingArea = NSTrackingArea(
+            rect: .zero,
+            options: [
+                .activeAlways,
+                .inVisibleRect,
+                .mouseMoved,
+                .mouseEnteredAndExited,
+            ],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        videoTrackingArea = trackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        updateHoveredVideo(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        updateHoveredVideo(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        clearHoverTrackingState()
+    }
+
+    @objc private func clipViewBoundsDidChange(_ notification: Notification) {
+        clearHoverTrackingState()
+    }
+
+    private func clearHoverTrackingState() {
+        lastHoverPoint = nil
+        setHoveredVideoURL(nil)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -602,6 +684,10 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
                 icon.draw(in: cell.iconFrame)
             }
 
+            if let playButtonFrame = playButtonFrame(at: index) {
+                drawPlayButton(in: playButtonFrame)
+            }
+
             if isSelected, let regions = selectionRects(at: index) {
                 drawTitleSelection(in: regions.title)
             }
@@ -616,6 +702,9 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        if activatePlayButton(at: point) {
+            return
+        }
         guard let cell = cells.first(where: { $0.frame.contains(point) }) else {
             selectedFileURL = nil
             needsDisplay = true
@@ -707,6 +796,34 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
             return nil
         }
         return cells[index].thumbnailRequestKey?.url
+    }
+
+    func playButtonFrame(at index: Int) -> NSRect? {
+        guard cells.indices.contains(index),
+              let hoveredVideoURL,
+              cells[index].file.url == hoveredVideoURL,
+              cells[index].file.category == .video,
+              !cells[index].file.isDirectory,
+              let thumbnail = cells[index].thumbnail else {
+            return nil
+        }
+
+        let thumbnailFrame = aspectFitRect(for: thumbnail, inside: cells[index].iconFrame)
+        let shortestEdge = min(thumbnailFrame.width, thumbnailFrame.height)
+        guard shortestEdge > 0 else {
+            return nil
+        }
+        let diameter = min(40, min(shortestEdge, max(24, shortestEdge * 0.5)))
+        return NSRect(
+            x: thumbnailFrame.midX - diameter / 2,
+            y: thumbnailFrame.midY - diameter / 2,
+            width: diameter,
+            height: diameter
+        )
+    }
+
+    func updateHoveredVideoForTesting(at point: NSPoint) {
+        updateHoveredVideo(at: point)
     }
 
     @discardableResult
@@ -959,6 +1076,93 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         path.fill()
     }
 
+    private func updateHoveredVideo(at point: NSPoint) {
+        layoutSubtreeIfNeeded()
+        lastHoverPoint = point
+        let hoveredURL = cells.first(where: {
+            $0.frame.contains(point)
+                && $0.file.category == .video
+                && !$0.file.isDirectory
+                && $0.thumbnail != nil
+        })?.file.url
+        setHoveredVideoURL(hoveredURL)
+    }
+
+    private func setHoveredVideoURL(_ url: URL?) {
+        guard hoveredVideoURL != url else {
+            return
+        }
+        let previousFrame = hoveredVideoURL.flatMap { previousURL in
+            cells.first(where: { $0.file.url == previousURL })?.frame
+        }
+        hoveredVideoURL = url
+        let nextFrame = url.flatMap { nextURL in
+            cells.first(where: { $0.file.url == nextURL })?.frame
+        }
+        if let previousFrame {
+            setNeedsDisplay(previousFrame)
+        }
+        if let nextFrame {
+            setNeedsDisplay(nextFrame)
+        }
+    }
+
+    private func reconcileHoveredVideo() {
+        guard let hoveredVideoURL else {
+            return
+        }
+        guard cells.contains(where: {
+            $0.file.url == hoveredVideoURL
+                && $0.file.category == .video
+                && !$0.file.isDirectory
+                && $0.thumbnail != nil
+        }) else {
+            setHoveredVideoURL(nil)
+            return
+        }
+    }
+
+    private func drawPlayButton(in rect: NSRect) {
+        let circle = NSBezierPath(ovalIn: rect)
+        NSColor.black.withAlphaComponent(0.58).setFill()
+        circle.fill()
+        NSColor.white.withAlphaComponent(0.9).setStroke()
+        circle.lineWidth = 1.5
+        circle.stroke()
+
+        let glyph = NSBezierPath()
+        glyph.move(to: NSPoint(
+            x: rect.midX - rect.width * 0.11,
+            y: rect.midY - rect.height * 0.19
+        ))
+        glyph.line(to: NSPoint(
+            x: rect.midX + rect.width * 0.2,
+            y: rect.midY
+        ))
+        glyph.line(to: NSPoint(
+            x: rect.midX - rect.width * 0.11,
+            y: rect.midY + rect.height * 0.19
+        ))
+        glyph.close()
+        NSColor.white.setFill()
+        glyph.fill()
+    }
+
+    private func activatePlayButton(at point: NSPoint) -> Bool {
+        guard let index = cells.indices.first(where: {
+            playButtonFrame(at: $0)?.contains(point) == true
+        }) else {
+            return false
+        }
+
+        let url = cells[index].file.url
+        selectedFileURL = url
+        setNeedsDisplay(cells[index].frame)
+        displayIfNeeded()
+        presentQuickLook(url: url)
+        return true
+    }
+
     private func rebuildCells() {
         guard bounds.width > 0 else {
             cells = []
@@ -1107,6 +1311,12 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         }
         cells[matchingIndex].thumbnail = image
         setNeedsDisplay(cells[matchingIndex].frame)
+        if image != nil,
+           hoveredVideoURL == nil,
+           cells[matchingIndex].file.category == .video,
+           let lastHoverPoint {
+            updateHoveredVideo(at: lastHoverPoint)
+        }
     }
 
     private func aspectFitRect(for image: NSImage, inside rect: NSRect) -> NSRect {
@@ -1542,6 +1752,11 @@ struct ZoneFileOperationEnvironment {
     var createFolder: (ZoneModel) throws -> URL
     var renameItem: (URL, String, ZoneModel) throws -> URL
     var trashItem: (URL) throws -> Void
+    var duplicateItem: (URL, ZoneModel) throws -> URL
+    var archiveDestination: (URL, ZoneModel) throws -> URL
+    var createArchive: (URL, URL, @escaping (Result<Void, Error>) -> Void) -> Void
+    var aliasDestination: (URL, ZoneModel) throws -> URL
+    var createAlias: (URL, URL) throws -> Void
     var beginRenaming: (URL, UUID) -> Bool
     var noteRefreshAttempt: (UUID) -> Void
     var presentError: (String, String) -> Void
@@ -1554,6 +1769,8 @@ private enum ZoneFileOperationError: LocalizedError {
     case itemOutsideZone(URL)
     case refreshFailed(Error)
     case renameTargetUnavailable(URL)
+    case unsafeCreatedItemURL(URL)
+    case missingCreatedItem(URL)
 
     var errorDescription: String? {
         switch self {
@@ -1569,6 +1786,10 @@ private enum ZoneFileOperationError: LocalizedError {
             return error.localizedDescription
         case let .renameTargetUnavailable(url):
             return "无法在刷新后找到项目：\(url.lastPathComponent)"
+        case let .unsafeCreatedItemURL(url):
+            return "无法安全映射新项目到当前分区目录：\(url.path)"
+        case let .missingCreatedItem(url):
+            return "映射后的新项目不存在：\(url.path)"
         }
     }
 }
@@ -1759,6 +1980,96 @@ final class ZoneFileOperationCoordinator {
         }
     }
 
+    @discardableResult
+    func duplicate(_ sourceFile: ZoneStoredFile, in zoneID: UUID) -> Result<URL, Error> {
+        let zone: ZoneModel
+        switch validatedItem(zoneID: zoneID, url: sourceFile.url) {
+        case let .success(validatedZone):
+            zone = validatedZone
+        case let .failure(error):
+            rejectStaleContext(zoneID: zoneID, error: error)
+            return .failure(error)
+        }
+
+        do {
+            let destination = try environment.duplicateItem(sourceFile.url, zone)
+            refreshAfterCreating(
+                cachedFile(from: sourceFile, at: destination),
+                in: zone.id
+            )
+            return .success(destination)
+        } catch {
+            environment.presentError("无法复制项目", error.localizedDescription)
+            return .failure(error)
+        }
+    }
+
+    func compress(_ sourceFile: ZoneStoredFile, in zoneID: UUID) {
+        let zone: ZoneModel
+        switch validatedItem(zoneID: zoneID, url: sourceFile.url) {
+        case let .success(validatedZone):
+            zone = validatedZone
+        case let .failure(error):
+            rejectStaleContext(zoneID: zoneID, error: error)
+            return
+        }
+
+        let destination: URL
+        do {
+            destination = try environment.archiveDestination(sourceFile.url, zone)
+        } catch {
+            environment.presentError("无法压缩项目", error.localizedDescription)
+            return
+        }
+
+        environment.createArchive(sourceFile.url, destination) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success:
+                    self.refreshAfterCreating(
+                        ZoneStoredFile(
+                            url: destination,
+                            displayName: destination.lastPathComponent,
+                            category: .archive
+                        ),
+                        in: zone.id
+                    )
+                case let .failure(error):
+                    self.environment.presentError("无法压缩项目", error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    @discardableResult
+    func makeAlias(_ sourceFile: ZoneStoredFile, in zoneID: UUID) -> Result<URL, Error> {
+        let zone: ZoneModel
+        switch validatedItem(zoneID: zoneID, url: sourceFile.url) {
+        case let .success(validatedZone):
+            zone = validatedZone
+        case let .failure(error):
+            rejectStaleContext(zoneID: zoneID, error: error)
+            return .failure(error)
+        }
+
+        do {
+            let destination = try environment.aliasDestination(sourceFile.url, zone)
+            try environment.createAlias(sourceFile.url, destination)
+            let alias = ZoneStoredFile(
+                url: destination,
+                displayName: destination.lastPathComponent,
+                category: DesktopFileClassifier.classify(url: destination),
+                isDirectory: false
+            )
+            refreshAfterCreating(alias, in: zone.id)
+            return .success(destination)
+        } catch {
+            environment.presentError("无法制作替身", error.localizedDescription)
+            return .failure(error)
+        }
+    }
+
     private func validatedItem(zoneID: UUID, url: URL) -> Result<ZoneModel, Error> {
         let config = environment.currentConfig()
         guard let zone = config.zones.first(where: { $0.id == zoneID }) else {
@@ -1813,6 +2124,79 @@ final class ZoneFileOperationCoordinator {
         )
     }
 
+    private func refreshAfterCreating(_ createdFile: ZoneStoredFile, in zoneID: UUID) {
+        switch refresh(zoneID: zoneID) {
+        case .success:
+            break
+        case let .failure(error):
+            guard let currentZone = environment.currentConfig().zones.first(where: {
+                $0.id == zoneID
+            }) else {
+                environment.presentError("无法刷新分区", error.localizedDescription)
+                return
+            }
+            let currentCreatedFile: ZoneStoredFile
+            do {
+                currentCreatedFile = try remappedCachedFile(
+                    createdFile,
+                    for: currentZone
+                )
+            } catch let mappingError {
+                environment.presentError(
+                    "无法刷新分区",
+                    "\(error.localizedDescription) \(mappingError.localizedDescription)，已跳过缓存插入。"
+                )
+                return
+            }
+            var files = environment.cachedFiles(zoneID)
+            files.removeAll(where: {
+                $0.url.standardizedFileURL == currentCreatedFile.url
+            })
+            files.append(currentCreatedFile)
+            installCached(files, for: currentZone)
+            presentRefreshFallback(error)
+        }
+    }
+
+    private func remappedCachedFile(
+        _ createdFile: ZoneStoredFile,
+        for zone: ZoneModel
+    ) throws -> ZoneStoredFile {
+        let directory = environment.directoryURL(zone).standardizedFileURL
+        let name = createdFile.url.lastPathComponent
+        guard directory.isFileURL,
+              createdFile.url.isFileURL,
+              !name.isEmpty,
+              name != "/",
+              name != ".",
+              name != ".."
+        else {
+            throw ZoneFileOperationError.unsafeCreatedItemURL(createdFile.url)
+        }
+
+        let currentURL = directory
+            .appendingPathComponent(name, isDirectory: createdFile.isDirectory)
+            .standardizedFileURL
+        guard currentURL.deletingLastPathComponent() == directory else {
+            throw ZoneFileOperationError.unsafeCreatedItemURL(currentURL)
+        }
+        guard environment.fileExists(currentURL) else {
+            throw ZoneFileOperationError.missingCreatedItem(currentURL)
+        }
+
+        var currentCreatedFile = createdFile
+        currentCreatedFile.url = currentURL
+        currentCreatedFile.displayName = currentURL.lastPathComponent
+        return currentCreatedFile
+    }
+
+    private func cachedFile(from sourceFile: ZoneStoredFile, at destination: URL) -> ZoneStoredFile {
+        var createdFile = sourceFile
+        createdFile.url = destination
+        createdFile.displayName = destination.lastPathComponent
+        return createdFile
+    }
+
     private func presentRefreshFallback(_ error: Error) {
         environment.presentError(
             "无法刷新分区",
@@ -1839,6 +2223,9 @@ final class WindowManager {
     var onChangeSortOrder: ((UUID, ZoneFileSortOrder) -> Void)?
     var onRenameFile: ((UUID, ZoneStoredFile, String) -> Result<URL, Error>)?
     var onTrashFile: ((UUID, URL) -> Void)?
+    var onDuplicateFile: ((UUID, ZoneStoredFile) -> Void)?
+    var onCompressFile: ((UUID, ZoneStoredFile) -> Void)?
+    var onMakeAliasFile: ((UUID, ZoneStoredFile) -> Void)?
     var onRefreshFiles: ((UUID) -> Void)?
     var onPresentFileError: ((String, String) -> Void)?
     var onValidateFile: ((UUID, URL) -> Bool)?
@@ -1874,6 +2261,30 @@ final class WindowManager {
                 return
             }
             self?.onTrashFile?(context.zoneID, url)
+        }
+        fileContextMenuController.onDuplicate = { [weak self] context in
+            guard let file = context.file else {
+                self?.onRefreshFiles?(context.zoneID)
+                self?.onPresentFileError?("项目已发生变化", "复制上下文已失效。")
+                return
+            }
+            self?.onDuplicateFile?(context.zoneID, file)
+        }
+        fileContextMenuController.onCompress = { [weak self] context in
+            guard let file = context.file else {
+                self?.onRefreshFiles?(context.zoneID)
+                self?.onPresentFileError?("项目已发生变化", "压缩上下文已失效。")
+                return
+            }
+            self?.onCompressFile?(context.zoneID, file)
+        }
+        fileContextMenuController.onMakeAlias = { [weak self] context in
+            guard let file = context.file else {
+                self?.onRefreshFiles?(context.zoneID)
+                self?.onPresentFileError?("项目已发生变化", "替身上下文已失效。")
+                return
+            }
+            self?.onMakeAliasFile?(context.zoneID, file)
         }
         fileContextMenuController.onRefresh = { [weak self] zoneID in
             self?.onRefreshFiles?(zoneID)
@@ -2107,6 +2518,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let configManager = ConfigManager()
     private let scanner = DesktopScanner()
     private let zoneLibrary = ZoneLibrary()
+    private let archiveCreator = DittoZoneArchiveCreator()
+    private let aliasCreator = FinderZoneAliasCreator()
     private let finderDefaults = UserDefaults(suiteName: "com.apple.finder")
     private var config: AppConfig!
     private var filesByZoneID: [UUID: [ZoneStoredFile]] = [:]
@@ -2133,6 +2546,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try zoneLibrary.renameStoredItem(at: url, to: name, in: zone)
             },
             trashItem: { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) },
+            duplicateItem: { [unowned self] url, zone in
+                try zoneLibrary.duplicateStoredItem(at: url, in: zone)
+            },
+            archiveDestination: { [unowned self] url, zone in
+                try zoneLibrary.archiveDestination(for: url, in: zone)
+            },
+            createArchive: { [unowned self] source, destination, completion in
+                archiveCreator.createArchive(
+                    from: source,
+                    to: destination,
+                    completion: completion
+                )
+            },
+            aliasDestination: { [unowned self] url, zone in
+                try zoneLibrary.aliasDestination(for: url, in: zone)
+            },
+            createAlias: { [unowned self] source, destination in
+                try aliasCreator.createAlias(from: source, to: destination)
+            },
             beginRenaming: { [unowned self] url, zoneID in
                 windowManager.selectAndRenameFile(at: url, in: zoneID)
             },
@@ -2232,6 +2664,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         windowManager.onTrashFile = { [weak self] zoneID, url in
             self?.trashStoredFile(url, in: zoneID)
+        }
+        windowManager.onDuplicateFile = { [weak self] zoneID, file in
+            self?.duplicateStoredFile(file, in: zoneID)
+        }
+        windowManager.onCompressFile = { [weak self] zoneID, file in
+            self?.compressStoredFile(file, in: zoneID)
+        }
+        windowManager.onMakeAliasFile = { [weak self] zoneID, file in
+            self?.makeAlias(for: file, in: zoneID)
         }
         windowManager.onRefreshFiles = { [weak self] zoneID in
             guard let self else { return }
@@ -2341,6 +2782,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func trashStoredFile(_ url: URL, in zoneID: UUID) {
         _ = fileOperationCoordinator.trash(url, in: zoneID)
+    }
+
+    private func duplicateStoredFile(_ file: ZoneStoredFile, in zoneID: UUID) {
+        _ = fileOperationCoordinator.duplicate(file, in: zoneID)
+    }
+
+    private func compressStoredFile(_ file: ZoneStoredFile, in zoneID: UUID) {
+        fileOperationCoordinator.compress(file, in: zoneID)
+    }
+
+    private func makeAlias(for file: ZoneStoredFile, in zoneID: UUID) {
+        _ = fileOperationCoordinator.makeAlias(file, in: zoneID)
     }
 
     @objc private func collectDesktopFiles() {

@@ -261,6 +261,241 @@ struct ZoneFilesViewSelectionTests {
         #expect(harness.filesByZoneID[harness.zone.id] == [expected])
     }
 
+    @Test("duplicate and alias refresh only after validated mutations")
+    func duplicateAndAliasCoordination() {
+        let harness = ZoneFileOperationHarness()
+        let source = harness.filesByZoneID[harness.zone.id]![0]
+
+        _ = harness.coordinator.duplicate(source, in: harness.zone.id)
+        _ = harness.coordinator.makeAlias(source, in: harness.zone.id)
+
+        #expect(harness.duplicatedURLs == [source.url])
+        #expect(harness.aliasPairs.first?.0 == source.url)
+        #expect(harness.refreshAttempts == [harness.zone.id, harness.zone.id])
+    }
+
+    @Test("duplicate scan failure caches the target with current sorting and preserves the source")
+    func duplicateScanFailureUsesCacheFallback() throws {
+        let harness = ZoneFileOperationHarness()
+        harness.scanError = OperationHarnessError.expected
+        harness.config.zones[0].fileSortOrder = .size
+        let currentZone = harness.config.zones[0]
+        let originalFiles = harness.filesByZoneID[harness.zone.id]!
+        let source = originalFiles[0]
+
+        let destination = try harness.coordinator.duplicate(source, in: harness.zone.id).get()
+        var expectedTarget = source
+        expectedTarget.url = destination
+        expectedTarget.displayName = destination.lastPathComponent
+
+        #expect(harness.installedZones.last == currentZone)
+        #expect(harness.filesByZoneID[harness.zone.id] == ZoneStoredFileSorter.sorted(
+            originalFiles + [expectedTarget],
+            by: .size
+        ))
+        #expect(harness.filesByZoneID[harness.zone.id]?.contains(source) == true)
+        #expect(expectedTarget.category == source.category)
+        #expect(expectedTarget.isDirectory == source.isDirectory)
+    }
+
+    @Test("scan failure refuses to cache a created URL that does not exist")
+    func scanFailureRejectsMissingCreatedURL() throws {
+        let harness = ZoneFileOperationHarness()
+        harness.scanError = OperationHarnessError.expected
+        harness.materializesDuplicate = false
+        let originalFiles = harness.filesByZoneID[harness.zone.id]!
+        let source = originalFiles[0]
+
+        let destination = try harness.coordinator.duplicate(source, in: harness.zone.id).get()
+
+        #expect(!harness.existingPaths.contains(destination.standardizedFileURL))
+        #expect(harness.installedZones.isEmpty)
+        #expect(harness.filesByZoneID[harness.zone.id] == originalFiles)
+        #expect(harness.presentedErrors.map(\.0) == ["无法刷新分区"])
+        #expect(harness.presentedErrors.first?.1.contains(destination.path) == true)
+        #expect(harness.presentedErrors.first?.1.contains("不存在") == true)
+    }
+
+    @Test("alias scan failure caches only target-derived fields with current sorting")
+    func aliasScanFailureUsesMinimalCacheFallback() throws {
+        let harness = ZoneFileOperationHarness()
+        let source = ZoneStoredFile(
+            url: harness.directoryURL.appendingPathComponent("movie.mov"),
+            displayName: "movie.mov",
+            category: .video,
+            fileSize: 4_096,
+            lastOpenedDate: Date(timeIntervalSince1970: 1),
+            dateAdded: Date(timeIntervalSince1970: 2),
+            modificationDate: Date(timeIntervalSince1970: 3),
+            creationDate: Date(timeIntervalSince1970: 4),
+            tagNames: ["Favorite"]
+        )
+        let originalFiles = [source] + harness.filesByZoneID[harness.zone.id]!
+        harness.filesByZoneID[harness.zone.id] = originalFiles
+        harness.existingPaths.insert(source.url.standardizedFileURL)
+        harness.scanError = OperationHarnessError.expected
+        harness.config.zones[0].fileSortOrder = .size
+
+        let destination = try harness.coordinator.makeAlias(source, in: harness.zone.id).get()
+        let expectedTarget = ZoneStoredFile(
+            url: destination,
+            displayName: destination.lastPathComponent,
+            category: DesktopFileClassifier.classify(url: destination),
+            isDirectory: false
+        )
+
+        #expect(harness.filesByZoneID[harness.zone.id] == ZoneStoredFileSorter.sorted(
+            originalFiles + [expectedTarget],
+            by: .size
+        ))
+        #expect(harness.filesByZoneID[harness.zone.id]?.contains(source) == true)
+        #expect(expectedTarget.category == .other)
+        #expect(expectedTarget.fileSize == nil)
+        #expect(expectedTarget.lastOpenedDate == nil)
+        #expect(expectedTarget.dateAdded == nil)
+        #expect(expectedTarget.modificationDate == nil)
+        #expect(expectedTarget.creationDate == nil)
+        #expect(expectedTarget.tagNames.isEmpty)
+    }
+
+    @Test("compression refreshes only after successful completion")
+    func compressionCompletionCoordination() async {
+        let harness = ZoneFileOperationHarness()
+        let source = harness.filesByZoneID[harness.zone.id]![0]
+
+        harness.coordinator.compress(source, in: harness.zone.id)
+        #expect(harness.archivePairs.count == 1)
+        #expect(harness.refreshAttempts.isEmpty)
+
+        harness.archiveCompletion?(.success(()))
+        await waitForMainQueue()
+        #expect(harness.refreshAttempts == [harness.zone.id])
+    }
+
+    @Test("compression scan failure remaps the target into the renamed zone directory")
+    func compressionScanFailureUsesCurrentZoneDirectory() async {
+        let harness = ZoneFileOperationHarness()
+        harness.scanError = OperationHarnessError.expected
+        let originalFiles = harness.filesByZoneID[harness.zone.id]!
+        let source = originalFiles[0]
+
+        harness.coordinator.compress(source, in: harness.zone.id)
+        let launchedDestination = harness.archivePairs[0].1
+        harness.config.zones[0].name = "Renamed Documents"
+        harness.config.zones[0].fileSortOrder = .size
+        let currentZone = harness.config.zones[0]
+        let currentDirectory = URL(
+            fileURLWithPath: "/library/Relocated/../Renamed Documents",
+            isDirectory: true
+        )
+        harness.directoryURLOverrides[currentZone.name] = currentDirectory
+
+        let currentDestination = currentDirectory.standardizedFileURL
+            .appendingPathComponent(launchedDestination.lastPathComponent)
+            .standardizedFileURL
+        harness.existingPaths.insert(currentDestination)
+
+        harness.archiveCompletion?(.success(()))
+        await waitForMainQueue()
+
+        let expectedTarget = ZoneStoredFile(
+            url: currentDestination,
+            displayName: currentDestination.lastPathComponent,
+            category: .archive
+        )
+        #expect(launchedDestination.standardizedFileURL != currentDestination)
+        #expect(harness.installedZones.last == currentZone)
+        #expect(harness.filesByZoneID[harness.zone.id] == ZoneStoredFileSorter.sorted(
+            originalFiles + [expectedTarget],
+            by: .size
+        ))
+        #expect(harness.filesByZoneID[harness.zone.id]?.last?.url == currentDestination)
+        #expect(currentDestination.deletingLastPathComponent() == currentDirectory.standardizedFileURL)
+        #expect(harness.filesByZoneID[harness.zone.id]?.contains(source) == true)
+        #expect(expectedTarget.category == .archive)
+        #expect(expectedTarget.isDirectory == false)
+    }
+
+    @Test("compression scan failure skips cache insertion when the current directory is unsafe")
+    func compressionScanFailureRejectsUnsafeCurrentDirectory() async {
+        let harness = ZoneFileOperationHarness()
+        harness.scanError = OperationHarnessError.expected
+        let source = harness.filesByZoneID[harness.zone.id]![0]
+        let originalFiles = harness.filesByZoneID
+
+        harness.coordinator.compress(source, in: harness.zone.id)
+        harness.config.zones[0].name = "Remote Documents"
+        harness.directoryURLOverrides["Remote Documents"] = URL(
+            string: "https://example.com/library"
+        )!
+
+        harness.archiveCompletion?(.success(()))
+        await waitForMainQueue()
+
+        #expect(harness.installedZones.isEmpty)
+        #expect(harness.cachedFileRequests.isEmpty)
+        #expect(harness.filesByZoneID == originalFiles)
+        #expect(harness.presentedErrors.map(\.0) == ["无法刷新分区"])
+        #expect(harness.presentedErrors.first?.1.contains("无法安全映射") == true)
+    }
+
+    @Test("compression scan failure does not restore a deleted zone")
+    func compressionScanFailureDoesNotRestoreDeletedZone() async {
+        let harness = ZoneFileOperationHarness()
+        harness.scanError = OperationHarnessError.expected
+        let source = harness.filesByZoneID[harness.zone.id]![0]
+        let originalFiles = harness.filesByZoneID
+
+        harness.coordinator.compress(source, in: harness.zone.id)
+        harness.config.zones.removeAll()
+        harness.archiveCompletion?(.success(()))
+        await waitForMainQueue()
+
+        #expect(harness.installedZones.isEmpty)
+        #expect(harness.cachedFileRequests.isEmpty)
+        #expect(harness.filesByZoneID == originalFiles)
+        #expect(harness.presentedErrors.map(\.0) == ["无法刷新分区"])
+    }
+
+    @Test("stale mutation context does not invoke item services")
+    func staleMutationContextIsRejected() {
+        let harness = ZoneFileOperationHarness()
+        let outside = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/outside/file.pdf"),
+            displayName: "file.pdf",
+            category: .document
+        )
+
+        _ = harness.coordinator.duplicate(outside, in: harness.zone.id)
+        harness.coordinator.compress(outside, in: harness.zone.id)
+        _ = harness.coordinator.makeAlias(outside, in: harness.zone.id)
+
+        #expect(harness.duplicatedURLs.isEmpty)
+        #expect(harness.archivePairs.isEmpty)
+        #expect(harness.aliasPairs.isEmpty)
+        #expect(harness.presentedErrors.count == 3)
+    }
+
+    @Test("mutation operation failures use action-specific error titles")
+    func mutationErrorsUseSpecificTitles() {
+        let harness = ZoneFileOperationHarness()
+        let source = harness.filesByZoneID[harness.zone.id]![0]
+        harness.duplicateError = OperationHarnessError.expected
+        _ = harness.coordinator.duplicate(source, in: harness.zone.id)
+        harness.duplicateError = nil
+
+        harness.archiveDestinationError = OperationHarnessError.expected
+        harness.coordinator.compress(source, in: harness.zone.id)
+        harness.archiveDestinationError = nil
+
+        harness.aliasError = OperationHarnessError.expected
+        _ = harness.coordinator.makeAlias(source, in: harness.zone.id)
+
+        #expect(harness.presentedErrors.map(\.0) == [
+            "无法复制项目", "无法压缩项目", "无法制作替身",
+        ])
+    }
+
     @Test("Open With and Share keep dynamic targets alive and dispatch injected services")
     func dynamicSystemTargetsAreRetained() {
         let controller = ZoneFileContextMenuController()
@@ -345,6 +580,8 @@ struct ZoneFilesViewSelectionTests {
         controller.sharingServicesProvider = { _ in [] }
         controller.pasteboardProvider = { pasteboard }
         controller.pasteboardURLWriter = { _, _ in false }
+        var presentedError: (String, String)?
+        controller.onPresentError = { presentedError = ($0, $1) }
 
         let menu = controller.menu(for: ZoneFileContext(
             zoneID: UUID(),
@@ -357,11 +594,13 @@ struct ZoneFilesViewSelectionTests {
             anchorRect: .zero,
             fileSortOrder: .name
         ))
-        if let copyItem = menu.items.first(where: { $0.title == "复制" }) {
+        if let copyItem = menu.items.first(where: { $0.title == "拷贝" }) {
             invoke(copyItem)
         }
 
         #expect(pasteboard.string(forType: .string) == "keep me")
+        #expect(presentedError?.0 == "无法拷贝项目")
+        #expect(presentedError?.1 == "无法将该项目写入剪贴板。")
     }
 
     @Test("blank context menu clears selection and contains new folder and sorting")
@@ -396,31 +635,67 @@ struct ZoneFilesViewSelectionTests {
         #expect(changedSortOrder == .tags)
     }
 
-    @Test("item context menu selects item and exposes Finder core actions")
-    func itemContextMenu() throws {
-        let fixture = try ZoneFilesViewFixture(fileCount: 1)
-        let frame = try #require(fixture.view.fileFrame(at: 0))
-        var renamedURL: URL?
-        var trashedURL: URL?
-        fixture.view.fileContextMenuController.onRename = { renamedURL = $0.file?.url }
-        fixture.view.fileContextMenuController.onTrash = { trashedURL = $0.file?.url }
+    @Test("folder and file context menus expose the agreed Finder actions")
+    func itemContextMenus() throws {
+        let fixture = try ZoneFilesViewFixture(fileCount: 0)
+        let folder = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/Folder", isDirectory: true),
+            displayName: "Folder",
+            category: .other,
+            isDirectory: true
+        )
+        let file = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/report.pdf"),
+            displayName: "report.pdf",
+            category: .document
+        )
+        fixture.view.setFiles([folder, file])
+        fixture.view.layoutSubtreeIfNeeded()
+        fixture.view.fileContextMenuController.onValidateItem = { _, _ in true }
+        fixture.view.fileContextMenuController.applicationURLsProvider = { _ in [] }
+        fixture.view.fileContextMenuController.sharingServicesProvider = { _ in [] }
 
-        let menu = try #require(fixture.view.menu(for: fixture.rightClickEvent(at: NSPoint(x: frame.midX, y: frame.midY))))
+        let folderFrame = try #require(fixture.view.fileFrame(at: 0))
+        let folderMenu = try #require(fixture.view.menu(for: fixture.rightClickEvent(
+            at: NSPoint(x: folderFrame.midX, y: folderFrame.midY)
+        )))
+        #expect(fixture.view.selectedFileURL == folder.url)
+        #expect(folderMenu.items.map { $0.isSeparatorItem ? "|" : $0.title } == [
+            "打开", "|", "移到废纸篓", "|", "显示简介", "重新命名",
+            "压缩“Folder”", "复制", "制作替身", "快速查看", "|",
+            "拷贝", "共享", "|", "在 Finder 中显示",
+        ])
+        #expect(!folderMenu.items.contains(where: { $0.title == "打开方式" }))
 
-        #expect(fixture.view.selectedFileURL == fixture.files[0].url)
-        #expect(menu.items.map { $0.isSeparatorItem ? "|" : $0.title } == [
+        let fileFrame = try #require(fixture.view.fileFrame(at: 1))
+        let fileMenu = try #require(fixture.view.menu(for: fixture.rightClickEvent(
+            at: NSPoint(x: fileFrame.midX, y: fileFrame.midY)
+        )))
+        #expect(fixture.view.selectedFileURL == file.url)
+        #expect(fileMenu.items.map { $0.isSeparatorItem ? "|" : $0.title } == [
             "打开", "打开方式", "|", "移到废纸篓", "|", "显示简介",
-            "重新命名", "复制", "快速查看", "共享", "|", "在 Finder 中显示",
+            "重新命名", "压缩“report.pdf”", "复制", "制作替身", "快速查看",
+            "|", "拷贝", "共享", "|", "在 Finder 中显示",
         ])
 
-        if let renameItem = menu.items.first(where: { $0.title == "重新命名" }) {
-            invoke(renameItem)
+        var duplicateCount = 0
+        var pasteboardWriteCount = 0
+        fixture.view.fileContextMenuController.onDuplicate = { _ in duplicateCount += 1 }
+        fixture.view.fileContextMenuController.pasteboardURLWriter = { _, _ in
+            pasteboardWriteCount += 1
+            return true
         }
-        if let trashItem = menu.items.first(where: { $0.title == "移到废纸篓" }) {
-            invoke(trashItem)
+        if let duplicateItem = fileMenu.items.first(where: { $0.title == "复制" }) {
+            invoke(duplicateItem)
         }
-        #expect(renamedURL == fixture.files[0].url)
-        #expect(trashedURL == fixture.files[0].url)
+        #expect(duplicateCount == 1)
+        #expect(pasteboardWriteCount == 0)
+
+        if let copyItem = fileMenu.items.first(where: { $0.title == "拷贝" }) {
+            invoke(copyItem)
+        }
+        #expect(duplicateCount == 1)
+        #expect(pasteboardWriteCount == 1)
     }
 
     @Test("media requests an injected thumbnail and documents retain icons")
@@ -630,6 +905,272 @@ struct ZoneFilesViewSelectionTests {
         let coloredBounds = try #require(pixelBounds(matching: thumbnailColor, in: bitmap))
 
         #expect(abs(coloredBounds.width / coloredBounds.height - 2) < 0.15)
+    }
+
+    @Test("only hovered videos with loaded thumbnails expose a play button")
+    func hoverPlayButtonEligibility() throws {
+        let provider = ImmediateThumbnailProvider()
+        let fixture = try ZoneFilesViewFixture(fileCount: 0, thumbnailProvider: provider)
+        let files = [
+            ZoneStoredFile(
+                url: URL(fileURLWithPath: "/tmp/movie.mov"),
+                displayName: "movie.mov",
+                category: .video
+            ),
+            ZoneStoredFile(
+                url: URL(fileURLWithPath: "/tmp/photo.png"),
+                displayName: "photo.png",
+                category: .image
+            ),
+            ZoneStoredFile(
+                url: URL(fileURLWithPath: "/tmp/screenshot.png"),
+                displayName: "screenshot.png",
+                category: .screenshot
+            ),
+            ZoneStoredFile(
+                url: URL(fileURLWithPath: "/tmp/Folder", isDirectory: true),
+                displayName: "Folder",
+                category: .other,
+                isDirectory: true
+            ),
+            ZoneStoredFile(
+                url: URL(fileURLWithPath: "/tmp/report.pdf"),
+                displayName: "report.pdf",
+                category: .document
+            ),
+        ]
+        fixture.view.setFiles(files)
+        fixture.view.layoutSubtreeIfNeeded()
+
+        for index in files.indices {
+            let frame = try #require(fixture.view.fileFrame(at: index))
+            fixture.view.updateHoveredVideoForTesting(at: NSPoint(
+                x: frame.midX,
+                y: frame.midY
+            ))
+            if index == 0 {
+                #expect(fixture.view.hoveredVideoURLForTesting == files[index].url)
+                #expect(fixture.view.playButtonFrame(at: index) != nil)
+            } else {
+                #expect(fixture.view.hoveredVideoURLForTesting == nil)
+                #expect(fixture.view.playButtonFrame(at: index) == nil)
+            }
+        }
+
+        let videoFrame = try #require(fixture.view.fileFrame(at: 0))
+        fixture.view.updateHoveredVideoForTesting(at: NSPoint(
+            x: videoFrame.midX,
+            y: videoFrame.midY
+        ))
+        #expect(fixture.view.hoveredVideoURLForTesting == files[0].url)
+
+        fixture.view.mouseExited(with: fixture.event(at: .zero, clickCount: 0))
+        #expect(fixture.view.hoveredVideoURLForTesting == nil)
+        #expect(fixture.view.playButtonFrame(at: 0) == nil)
+    }
+
+    @Test("a deferred video thumbnail gates the play button")
+    func deferredVideoThumbnailGatesPlayButton() throws {
+        let provider = DeferredThumbnailProvider()
+        let fixture = try ZoneFilesViewFixture(fileCount: 0, thumbnailProvider: provider)
+        let video = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/deferred.mov"),
+            displayName: "deferred.mov",
+            category: .video
+        )
+        fixture.view.setFiles([video])
+        fixture.view.layoutSubtreeIfNeeded()
+        let frame = try #require(fixture.view.fileFrame(at: 0))
+        let center = NSPoint(x: frame.midX, y: frame.midY)
+
+        fixture.view.updateHoveredVideoForTesting(at: center)
+        #expect(fixture.view.hoveredVideoURLForTesting == nil)
+        #expect(fixture.view.playButtonFrame(at: 0) == nil)
+
+        provider.complete(
+            requestAt: 0,
+            image: makeSolidImage(size: NSSize(width: 80, height: 40))
+        )
+
+        #expect(fixture.view.hoveredVideoURLForTesting == video.url)
+        #expect(fixture.view.playButtonFrame(at: 0) != nil)
+
+        let exitProvider = DeferredThumbnailProvider()
+        let exitFixture = try ZoneFilesViewFixture(
+            fileCount: 0,
+            thumbnailProvider: exitProvider
+        )
+        exitFixture.view.setFiles([video])
+        exitFixture.view.layoutSubtreeIfNeeded()
+        let exitFrame = try #require(exitFixture.view.fileFrame(at: 0))
+        exitFixture.view.updateHoveredVideoForTesting(at: NSPoint(
+            x: exitFrame.midX,
+            y: exitFrame.midY
+        ))
+        exitFixture.view.mouseExited(with: exitFixture.event(at: .zero, clickCount: 0))
+        exitProvider.complete(
+            requestAt: 0,
+            image: makeSolidImage(size: NSSize(width: 80, height: 40))
+        )
+
+        #expect(exitFixture.view.hoveredVideoURLForTesting == nil)
+        #expect(exitFixture.view.playButtonFrame(at: 0) == nil)
+    }
+
+    @Test("scrolling clears hover coordinates and prevents late thumbnail revival")
+    func scrollClearsVideoHoverState() throws {
+        let immediateProvider = ImmediateThumbnailProvider()
+        let fixture = try ZoneFilesViewFixture(
+            fileCount: 0,
+            thumbnailProvider: immediateProvider,
+            embeddedInScrollView: true
+        )
+        let video = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/scrolled.mov"),
+            displayName: "scrolled.mov",
+            category: .video
+        )
+        let documents = (0..<12).map { index in
+            ZoneStoredFile(
+                url: URL(fileURLWithPath: "/tmp/scroll-\(index).pdf"),
+                displayName: "scroll-\(index).pdf",
+                category: .document
+            )
+        }
+        fixture.view.setFiles([video] + documents)
+        fixture.view.layoutSubtreeIfNeeded()
+        let videoFrame = try #require(fixture.view.fileFrame(at: 0))
+        fixture.view.updateHoveredVideoForTesting(at: NSPoint(
+            x: videoFrame.midX,
+            y: videoFrame.midY
+        ))
+        #expect(fixture.view.hoveredVideoURLForTesting == video.url)
+
+        let clipView = try #require(fixture.view.enclosingScrollView?.contentView)
+        clipView.scroll(to: NSPoint(x: 0, y: 20))
+        #expect(fixture.view.hoveredVideoURLForTesting == nil)
+
+        clipView.scroll(to: .zero)
+        fixture.view.updateHoveredVideoForTesting(at: NSPoint(
+            x: videoFrame.midX,
+            y: videoFrame.midY
+        ))
+        let deferredProvider = DeferredThumbnailProvider()
+        fixture.view.thumbnailProvider = deferredProvider
+        #expect(fixture.view.hoveredVideoURLForTesting == nil)
+
+        clipView.scroll(to: NSPoint(x: 0, y: 20))
+        deferredProvider.complete(
+            requestAt: 0,
+            image: makeSolidImage(size: NSSize(width: 80, height: 40))
+        )
+
+        #expect(fixture.view.hoveredVideoURLForTesting == nil)
+        #expect(fixture.view.playButtonFrame(at: 0) == nil)
+    }
+
+    @Test("hover follows a video URL across reordered cells and clears when removed")
+    func hoverReconcilesByURLAfterRefresh() throws {
+        let provider = ImmediateThumbnailProvider()
+        let fixture = try ZoneFilesViewFixture(fileCount: 0, thumbnailProvider: provider)
+        let video = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/reordered.mov"),
+            displayName: "reordered.mov",
+            category: .video
+        )
+        let image = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/reordered.png"),
+            displayName: "reordered.png",
+            category: .image
+        )
+        fixture.view.setFiles([video, image])
+        fixture.view.layoutSubtreeIfNeeded()
+        let initialFrame = try #require(fixture.view.fileFrame(at: 0))
+        fixture.view.updateHoveredVideoForTesting(at: NSPoint(
+            x: initialFrame.midX,
+            y: initialFrame.midY
+        ))
+
+        fixture.view.setFiles([image, video])
+        fixture.view.layoutSubtreeIfNeeded()
+
+        #expect(fixture.view.hoveredVideoURLForTesting == video.url)
+        #expect(fixture.view.playButtonFrame(at: 0) == nil)
+        #expect(fixture.view.playButtonFrame(at: 1) != nil)
+
+        fixture.view.setFiles([image])
+        fixture.view.layoutSubtreeIfNeeded()
+        #expect(fixture.view.hoveredVideoURLForTesting == nil)
+    }
+
+    @Test("hover drawing changes only pixels around the video thumbnail center")
+    func hoverDrawsPlayButtonNearThumbnailCenter() throws {
+        let provider = ImmediateThumbnailProvider(
+            image: makeSolidImage(size: NSSize(width: 80, height: 40))
+        )
+        let fixture = try ZoneFilesViewFixture(fileCount: 0, thumbnailProvider: provider)
+        let video = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/drawing.mov"),
+            displayName: "drawing.mov",
+            category: .video
+        )
+        fixture.view.setFiles([video])
+        fixture.view.layoutSubtreeIfNeeded()
+        let before = try fixture.renderedBitmap()
+        let fileFrame = try #require(fixture.view.fileFrame(at: 0))
+        fixture.view.updateHoveredVideoForTesting(at: NSPoint(
+            x: fileFrame.midX,
+            y: fileFrame.midY
+        ))
+        let after = try fixture.renderedBitmap()
+        let playFrame = try #require(fixture.view.playButtonFrame(at: 0))
+        let changedBounds = try #require(changedPixelBounds(from: before, to: after))
+
+        #expect(changedPixelCount(from: before, to: after) > 100)
+        #expect(playFrame.insetBy(dx: -3, dy: -3).contains(changedBounds))
+        #expect(abs(changedBounds.midX - playFrame.midX) < 3)
+        #expect(abs(changedBounds.midY - playFrame.midY) < 3)
+    }
+
+    @Test("play button selects the video and routes only that click to Quick Look")
+    func playButtonClickRoutesQuickLook() throws {
+        let provider = ImmediateThumbnailProvider()
+        let fixture = try ZoneFilesViewFixture(fileCount: 0, thumbnailProvider: provider)
+        let video = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/quick-look.mov"),
+            displayName: "quick-look.mov",
+            category: .video
+        )
+        fixture.view.setFiles([video])
+        fixture.view.layoutSubtreeIfNeeded()
+        let fileFrame = try #require(fixture.view.fileFrame(at: 0))
+        fixture.view.updateHoveredVideoForTesting(at: NSPoint(
+            x: fileFrame.midX,
+            y: fileFrame.midY
+        ))
+        let playFrame = try #require(fixture.view.playButtonFrame(at: 0))
+        let panel = QuickLookPanelSpy(currentController: fixture.view)
+        fixture.view.quickLookPanelProvider = { panel }
+
+        fixture.click(at: NSPoint(x: playFrame.midX, y: playFrame.midY))
+
+        #expect(fixture.view.selectedFileURL == video.url)
+        #expect(panel.events.contains("reloadData"))
+        #expect(panel.events.contains("show"))
+
+        fixture.click(at: NSPoint(x: fileFrame.maxX - 2, y: fileFrame.midY))
+        #expect(fixture.view.selectedFileURL == video.url)
+        #expect(panel.events.filter { $0 == "reloadData" }.count == 1)
+        #expect(panel.events.filter { $0 == "show" }.count == 1)
+
+        var openedURL: URL?
+        fixture.view.onOpenFile = { openedURL = $0 }
+        fixture.click(
+            at: NSPoint(x: fileFrame.maxX - 2, y: fileFrame.midY),
+            clickCount: 2
+        )
+        #expect(openedURL == video.url)
+        #expect(panel.events.filter { $0 == "show" }.count == 1)
     }
 
     @Test("inline rename starts on the title and escape cancels")
@@ -1088,16 +1629,29 @@ private final class ZoneFileOperationHarness {
         acceptedCategories: [.document],
         locked: false
     )
-    let directoryURL = URL(fileURLWithPath: "/library/Documents", isDirectory: true)
-    let createdURL = URL(fileURLWithPath: "/library/Documents/New Folder", isDirectory: true)
+    let libraryURL = URL(fileURLWithPath: "/library", isDirectory: true)
+    var directoryURLOverrides: [String: URL] = [:]
+    var directoryURL: URL { directoryURL(for: zone) }
+    var createdURL: URL { directoryURL.appendingPathComponent("New Folder", isDirectory: true) }
     var config: AppConfig
     var filesByZoneID: [UUID: [ZoneStoredFile]]
     var existingPaths: Set<URL>
     var saveError: Error?
     var scanError: Error?
+    var duplicateError: Error?
+    var archiveDestinationError: Error?
+    var aliasError: Error?
+    var materializesDuplicate = true
+    var materializesArchive = true
+    var materializesAlias = true
     var installedZones: [ZoneModel] = []
     var trashedURLs: [URL] = []
+    var duplicatedURLs: [URL] = []
+    var archivePairs: [(URL, URL)] = []
+    var aliasPairs: [(URL, URL)] = []
+    var archiveCompletion: ((Result<Void, Error>) -> Void)?
     var refreshAttempts: [UUID] = []
+    var cachedFileRequests: [UUID] = []
     var presentedErrors: [(String, String)] = []
     var events: [String] = []
 
@@ -1107,7 +1661,10 @@ private final class ZoneFileOperationHarness {
             if let saveError { throw saveError }
         },
         applyConfig: { [unowned self] in config = $0 },
-        cachedFiles: { [unowned self] in filesByZoneID[$0] ?? [] },
+        cachedFiles: { [unowned self] zoneID in
+            cachedFileRequests.append(zoneID)
+            return filesByZoneID[zoneID] ?? []
+        },
         installFiles: { [unowned self] zone, files in
             events.append("install")
             installedZones.append(zone)
@@ -1118,7 +1675,7 @@ private final class ZoneFileOperationHarness {
             if let scanError { throw scanError }
             return filesByZoneID[zone.id] ?? []
         },
-        directoryURL: { [unowned self] _ in directoryURL },
+        directoryURL: { [unowned self] in directoryURL(for: $0) },
         fileExists: { [unowned self] in existingPaths.contains($0.standardizedFileURL) },
         createFolder: { [unowned self] _ in
             events.append("create")
@@ -1132,6 +1689,38 @@ private final class ZoneFileOperationHarness {
             trashedURLs.append(url)
             existingPaths.remove(url.standardizedFileURL)
         },
+        duplicateItem: { [unowned self] source, _ in
+            if let duplicateError { throw duplicateError }
+            duplicatedURLs.append(source)
+            let destination = source.deletingLastPathComponent().appendingPathComponent("large copy")
+            if materializesDuplicate {
+                existingPaths.insert(destination.standardizedFileURL)
+            }
+            return destination
+        },
+        archiveDestination: { [unowned self] source, _ in
+            if let archiveDestinationError { throw archiveDestinationError }
+            return source.deletingLastPathComponent().appendingPathComponent("large.zip")
+        },
+        createArchive: { [unowned self] source, destination, completion in
+            archivePairs.append((source, destination))
+            archiveCompletion = { [unowned self] result in
+                if case .success = result, materializesArchive {
+                    existingPaths.insert(destination.standardizedFileURL)
+                }
+                completion(result)
+            }
+        },
+        aliasDestination: { source, _ in
+            source.deletingLastPathComponent().appendingPathComponent("large alias")
+        },
+        createAlias: { [unowned self] source, destination in
+            if let aliasError { throw aliasError }
+            aliasPairs.append((source, destination))
+            if materializesAlias {
+                existingPaths.insert(destination.standardizedFileURL)
+            }
+        },
         beginRenaming: { [unowned self] _, _ in
             events.append("rename")
             return true
@@ -1142,22 +1731,31 @@ private final class ZoneFileOperationHarness {
 
     init() {
         config = AppConfig(zones: [zone])
+        let initialDirectoryURL = URL(
+            fileURLWithPath: "/library/Documents",
+            isDirectory: true
+        )
         let files = [
             ZoneStoredFile(
-                url: directoryURL.appendingPathComponent("large"),
+                url: initialDirectoryURL.appendingPathComponent("large"),
                 displayName: "large",
                 category: .document,
                 fileSize: 20
             ),
             ZoneStoredFile(
-                url: directoryURL.appendingPathComponent("small"),
+                url: initialDirectoryURL.appendingPathComponent("small"),
                 displayName: "small",
                 category: .document,
                 fileSize: 10
             ),
         ]
         filesByZoneID = [zone.id: files]
-        existingPaths = Set(([directoryURL] + files.map(\.url)).map(\.standardizedFileURL))
+        existingPaths = Set(([initialDirectoryURL] + files.map(\.url)).map(\.standardizedFileURL))
+    }
+
+    func directoryURL(for zone: ZoneModel) -> URL {
+        directoryURLOverrides[zone.name]
+            ?? libraryURL.appendingPathComponent(zone.name, isDirectory: true)
     }
 }
 
@@ -1183,6 +1781,44 @@ private func changedPixelCount(
         }
     }
     return count
+}
+
+private func changedPixelBounds(
+    from first: NSBitmapImageRep,
+    to second: NSBitmapImageRep
+) -> NSRect? {
+    var minX = min(first.pixelsWide, second.pixelsWide)
+    var minY = min(first.pixelsHigh, second.pixelsHigh)
+    var maxX = -1
+    var maxY = -1
+    for y in 0..<min(first.pixelsHigh, second.pixelsHigh) {
+        for x in 0..<min(first.pixelsWide, second.pixelsWide) {
+            guard let firstColor = first.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
+                  let secondColor = second.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB)
+            else {
+                continue
+            }
+            let difference = abs(firstColor.redComponent - secondColor.redComponent)
+                + abs(firstColor.greenComponent - secondColor.greenComponent)
+                + abs(firstColor.blueComponent - secondColor.blueComponent)
+                + abs(firstColor.alphaComponent - secondColor.alphaComponent)
+            if difference > 0.08 {
+                minX = min(minX, x)
+                minY = min(minY, y)
+                maxX = max(maxX, x)
+                maxY = max(maxY, y)
+            }
+        }
+    }
+    guard maxX >= minX, maxY >= minY else {
+        return nil
+    }
+    return NSRect(
+        x: minX,
+        y: minY,
+        width: maxX - minX + 1,
+        height: maxY - minY + 1
+    )
 }
 
 @MainActor
@@ -1359,7 +1995,8 @@ private final class ZoneFilesViewFixture {
         fileCount: Int,
         layout: FinderDesktopIconLayout = .finderDefault,
         thumbnailProvider: ZoneFileThumbnailProviding? = nil,
-        backingScaleFactor: CGFloat? = nil
+        backingScaleFactor: CGFloat? = nil,
+        embeddedInScrollView: Bool = false
     ) throws {
         view = ZoneFilesView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
         view.quickLookApplicationActivator = {}
@@ -1386,7 +2023,14 @@ private final class ZoneFilesViewFixture {
                 defer: false
             )
         }
-        window.contentView = view
+        if embeddedInScrollView {
+            let scrollView = NSScrollView(frame: view.frame)
+            scrollView.hasVerticalScroller = true
+            scrollView.documentView = view
+            window.contentView = scrollView
+        } else {
+            window.contentView = view
+        }
         view.setFiles(files, layout: layout)
         view.layoutSubtreeIfNeeded()
     }
