@@ -480,6 +480,10 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
     private var cells: [Cell] = []
     private var fileLayout = FinderDesktopIconLayout.finderDefault
     private var thumbnailGeneration = 0
+    private var videoTrackingArea: NSTrackingArea?
+    private weak var observedClipView: NSClipView?
+    private var hoveredVideoURL: URL?
+    private var lastHoverPoint: NSPoint?
     private var renameEditor: NSTextField?
     private var renamingFileURL: URL?
     private var renamingFileSnapshot: ZoneStoredFile?
@@ -501,6 +505,7 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
                 cells[index].thumbnailRequestKey = nil
             }
             requestThumbnails()
+            reconcileHoveredVideo()
             needsDisplay = true
         }
     }
@@ -516,6 +521,10 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
 
     var quickLookDataSourceForTesting: ZoneQuickLookDataSource? {
         quickLookDataSource
+    }
+
+    var hoveredVideoURLForTesting: URL? {
+        hoveredVideoURL
     }
 
     var isRenamingFile: Bool {
@@ -552,6 +561,12 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
             cancelRenaming()
         }
         thumbnailGeneration &+= 1
+        if let hoveredVideoURL,
+           !files.contains(where: {
+               $0.url == hoveredVideoURL && $0.category == .video && !$0.isDirectory
+           }) {
+            setHoveredVideoURL(nil)
+        }
         self.files = files
         cells = []
         fileLayout = layout
@@ -569,10 +584,77 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         true
     }
 
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+
+        if let observedClipView {
+            NotificationCenter.default.removeObserver(
+                self,
+                name: NSView.boundsDidChangeNotification,
+                object: observedClipView
+            )
+        }
+        observedClipView = enclosingScrollView?.contentView
+        guard let observedClipView else {
+            return
+        }
+        observedClipView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(clipViewBoundsDidChange(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: observedClipView
+        )
+    }
+
     override func layout() {
         super.layout()
         rebuildCells()
+        reconcileHoveredVideo()
         updateRenameEditorFrame()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        if let videoTrackingArea {
+            removeTrackingArea(videoTrackingArea)
+        }
+
+        let trackingArea = NSTrackingArea(
+            rect: .zero,
+            options: [
+                .activeAlways,
+                .inVisibleRect,
+                .mouseMoved,
+                .mouseEnteredAndExited,
+            ],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        videoTrackingArea = trackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        updateHoveredVideo(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        updateHoveredVideo(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        clearHoverTrackingState()
+    }
+
+    @objc private func clipViewBoundsDidChange(_ notification: Notification) {
+        clearHoverTrackingState()
+    }
+
+    private func clearHoverTrackingState() {
+        lastHoverPoint = nil
+        setHoveredVideoURL(nil)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -599,6 +681,10 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
                 icon.draw(in: cell.iconFrame)
             }
 
+            if let playButtonFrame = playButtonFrame(at: index) {
+                drawPlayButton(in: playButtonFrame)
+            }
+
             if isSelected, let regions = selectionRects(at: index) {
                 drawTitleSelection(in: regions.title)
             }
@@ -613,6 +699,9 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        if activatePlayButton(at: point) {
+            return
+        }
         guard let cell = cells.first(where: { $0.frame.contains(point) }) else {
             selectedFileURL = nil
             needsDisplay = true
@@ -704,6 +793,34 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
             return nil
         }
         return cells[index].thumbnailRequestKey?.url
+    }
+
+    func playButtonFrame(at index: Int) -> NSRect? {
+        guard cells.indices.contains(index),
+              let hoveredVideoURL,
+              cells[index].file.url == hoveredVideoURL,
+              cells[index].file.category == .video,
+              !cells[index].file.isDirectory,
+              let thumbnail = cells[index].thumbnail else {
+            return nil
+        }
+
+        let thumbnailFrame = aspectFitRect(for: thumbnail, inside: cells[index].iconFrame)
+        let shortestEdge = min(thumbnailFrame.width, thumbnailFrame.height)
+        guard shortestEdge > 0 else {
+            return nil
+        }
+        let diameter = min(40, min(shortestEdge, max(24, shortestEdge * 0.5)))
+        return NSRect(
+            x: thumbnailFrame.midX - diameter / 2,
+            y: thumbnailFrame.midY - diameter / 2,
+            width: diameter,
+            height: diameter
+        )
+    }
+
+    func updateHoveredVideoForTesting(at point: NSPoint) {
+        updateHoveredVideo(at: point)
     }
 
     @discardableResult
@@ -945,6 +1062,93 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         path.fill()
     }
 
+    private func updateHoveredVideo(at point: NSPoint) {
+        layoutSubtreeIfNeeded()
+        lastHoverPoint = point
+        let hoveredURL = cells.first(where: {
+            $0.frame.contains(point)
+                && $0.file.category == .video
+                && !$0.file.isDirectory
+                && $0.thumbnail != nil
+        })?.file.url
+        setHoveredVideoURL(hoveredURL)
+    }
+
+    private func setHoveredVideoURL(_ url: URL?) {
+        guard hoveredVideoURL != url else {
+            return
+        }
+        let previousFrame = hoveredVideoURL.flatMap { previousURL in
+            cells.first(where: { $0.file.url == previousURL })?.frame
+        }
+        hoveredVideoURL = url
+        let nextFrame = url.flatMap { nextURL in
+            cells.first(where: { $0.file.url == nextURL })?.frame
+        }
+        if let previousFrame {
+            setNeedsDisplay(previousFrame)
+        }
+        if let nextFrame {
+            setNeedsDisplay(nextFrame)
+        }
+    }
+
+    private func reconcileHoveredVideo() {
+        guard let hoveredVideoURL else {
+            return
+        }
+        guard cells.contains(where: {
+            $0.file.url == hoveredVideoURL
+                && $0.file.category == .video
+                && !$0.file.isDirectory
+                && $0.thumbnail != nil
+        }) else {
+            setHoveredVideoURL(nil)
+            return
+        }
+    }
+
+    private func drawPlayButton(in rect: NSRect) {
+        let circle = NSBezierPath(ovalIn: rect)
+        NSColor.black.withAlphaComponent(0.58).setFill()
+        circle.fill()
+        NSColor.white.withAlphaComponent(0.9).setStroke()
+        circle.lineWidth = 1.5
+        circle.stroke()
+
+        let glyph = NSBezierPath()
+        glyph.move(to: NSPoint(
+            x: rect.midX - rect.width * 0.11,
+            y: rect.midY - rect.height * 0.19
+        ))
+        glyph.line(to: NSPoint(
+            x: rect.midX + rect.width * 0.2,
+            y: rect.midY
+        ))
+        glyph.line(to: NSPoint(
+            x: rect.midX - rect.width * 0.11,
+            y: rect.midY + rect.height * 0.19
+        ))
+        glyph.close()
+        NSColor.white.setFill()
+        glyph.fill()
+    }
+
+    private func activatePlayButton(at point: NSPoint) -> Bool {
+        guard let index = cells.indices.first(where: {
+            playButtonFrame(at: $0)?.contains(point) == true
+        }) else {
+            return false
+        }
+
+        let url = cells[index].file.url
+        selectedFileURL = url
+        setNeedsDisplay(cells[index].frame)
+        displayIfNeeded()
+        presentQuickLook(url: url)
+        return true
+    }
+
     private func rebuildCells() {
         guard bounds.width > 0 else {
             cells = []
@@ -1093,6 +1297,12 @@ final class ZoneFilesView: NSView, NSTextFieldDelegate {
         }
         cells[matchingIndex].thumbnail = image
         setNeedsDisplay(cells[matchingIndex].frame)
+        if image != nil,
+           hoveredVideoURL == nil,
+           cells[matchingIndex].file.category == .video,
+           let lastHoverPoint {
+            updateHoveredVideo(at: lastHoverPoint)
+        }
     }
 
     private func aspectFitRect(for image: NSImage, inside rect: NSRect) -> NSRect {

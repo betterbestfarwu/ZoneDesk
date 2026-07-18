@@ -857,6 +857,272 @@ struct ZoneFilesViewSelectionTests {
         #expect(abs(coloredBounds.width / coloredBounds.height - 2) < 0.15)
     }
 
+    @Test("only hovered videos with loaded thumbnails expose a play button")
+    func hoverPlayButtonEligibility() throws {
+        let provider = ImmediateThumbnailProvider()
+        let fixture = try ZoneFilesViewFixture(fileCount: 0, thumbnailProvider: provider)
+        let files = [
+            ZoneStoredFile(
+                url: URL(fileURLWithPath: "/tmp/movie.mov"),
+                displayName: "movie.mov",
+                category: .video
+            ),
+            ZoneStoredFile(
+                url: URL(fileURLWithPath: "/tmp/photo.png"),
+                displayName: "photo.png",
+                category: .image
+            ),
+            ZoneStoredFile(
+                url: URL(fileURLWithPath: "/tmp/screenshot.png"),
+                displayName: "screenshot.png",
+                category: .screenshot
+            ),
+            ZoneStoredFile(
+                url: URL(fileURLWithPath: "/tmp/Folder", isDirectory: true),
+                displayName: "Folder",
+                category: .other,
+                isDirectory: true
+            ),
+            ZoneStoredFile(
+                url: URL(fileURLWithPath: "/tmp/report.pdf"),
+                displayName: "report.pdf",
+                category: .document
+            ),
+        ]
+        fixture.view.setFiles(files)
+        fixture.view.layoutSubtreeIfNeeded()
+
+        for index in files.indices {
+            let frame = try #require(fixture.view.fileFrame(at: index))
+            fixture.view.updateHoveredVideoForTesting(at: NSPoint(
+                x: frame.midX,
+                y: frame.midY
+            ))
+            if index == 0 {
+                #expect(fixture.view.hoveredVideoURLForTesting == files[index].url)
+                #expect(fixture.view.playButtonFrame(at: index) != nil)
+            } else {
+                #expect(fixture.view.hoveredVideoURLForTesting == nil)
+                #expect(fixture.view.playButtonFrame(at: index) == nil)
+            }
+        }
+
+        let videoFrame = try #require(fixture.view.fileFrame(at: 0))
+        fixture.view.updateHoveredVideoForTesting(at: NSPoint(
+            x: videoFrame.midX,
+            y: videoFrame.midY
+        ))
+        #expect(fixture.view.hoveredVideoURLForTesting == files[0].url)
+
+        fixture.view.mouseExited(with: fixture.event(at: .zero, clickCount: 0))
+        #expect(fixture.view.hoveredVideoURLForTesting == nil)
+        #expect(fixture.view.playButtonFrame(at: 0) == nil)
+    }
+
+    @Test("a deferred video thumbnail gates the play button")
+    func deferredVideoThumbnailGatesPlayButton() throws {
+        let provider = DeferredThumbnailProvider()
+        let fixture = try ZoneFilesViewFixture(fileCount: 0, thumbnailProvider: provider)
+        let video = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/deferred.mov"),
+            displayName: "deferred.mov",
+            category: .video
+        )
+        fixture.view.setFiles([video])
+        fixture.view.layoutSubtreeIfNeeded()
+        let frame = try #require(fixture.view.fileFrame(at: 0))
+        let center = NSPoint(x: frame.midX, y: frame.midY)
+
+        fixture.view.updateHoveredVideoForTesting(at: center)
+        #expect(fixture.view.hoveredVideoURLForTesting == nil)
+        #expect(fixture.view.playButtonFrame(at: 0) == nil)
+
+        provider.complete(
+            requestAt: 0,
+            image: makeSolidImage(size: NSSize(width: 80, height: 40))
+        )
+
+        #expect(fixture.view.hoveredVideoURLForTesting == video.url)
+        #expect(fixture.view.playButtonFrame(at: 0) != nil)
+
+        let exitProvider = DeferredThumbnailProvider()
+        let exitFixture = try ZoneFilesViewFixture(
+            fileCount: 0,
+            thumbnailProvider: exitProvider
+        )
+        exitFixture.view.setFiles([video])
+        exitFixture.view.layoutSubtreeIfNeeded()
+        let exitFrame = try #require(exitFixture.view.fileFrame(at: 0))
+        exitFixture.view.updateHoveredVideoForTesting(at: NSPoint(
+            x: exitFrame.midX,
+            y: exitFrame.midY
+        ))
+        exitFixture.view.mouseExited(with: exitFixture.event(at: .zero, clickCount: 0))
+        exitProvider.complete(
+            requestAt: 0,
+            image: makeSolidImage(size: NSSize(width: 80, height: 40))
+        )
+
+        #expect(exitFixture.view.hoveredVideoURLForTesting == nil)
+        #expect(exitFixture.view.playButtonFrame(at: 0) == nil)
+    }
+
+    @Test("scrolling clears hover coordinates and prevents late thumbnail revival")
+    func scrollClearsVideoHoverState() throws {
+        let immediateProvider = ImmediateThumbnailProvider()
+        let fixture = try ZoneFilesViewFixture(
+            fileCount: 0,
+            thumbnailProvider: immediateProvider,
+            embeddedInScrollView: true
+        )
+        let video = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/scrolled.mov"),
+            displayName: "scrolled.mov",
+            category: .video
+        )
+        let documents = (0..<12).map { index in
+            ZoneStoredFile(
+                url: URL(fileURLWithPath: "/tmp/scroll-\(index).pdf"),
+                displayName: "scroll-\(index).pdf",
+                category: .document
+            )
+        }
+        fixture.view.setFiles([video] + documents)
+        fixture.view.layoutSubtreeIfNeeded()
+        let videoFrame = try #require(fixture.view.fileFrame(at: 0))
+        fixture.view.updateHoveredVideoForTesting(at: NSPoint(
+            x: videoFrame.midX,
+            y: videoFrame.midY
+        ))
+        #expect(fixture.view.hoveredVideoURLForTesting == video.url)
+
+        let clipView = try #require(fixture.view.enclosingScrollView?.contentView)
+        clipView.scroll(to: NSPoint(x: 0, y: 20))
+        #expect(fixture.view.hoveredVideoURLForTesting == nil)
+
+        clipView.scroll(to: .zero)
+        fixture.view.updateHoveredVideoForTesting(at: NSPoint(
+            x: videoFrame.midX,
+            y: videoFrame.midY
+        ))
+        let deferredProvider = DeferredThumbnailProvider()
+        fixture.view.thumbnailProvider = deferredProvider
+        #expect(fixture.view.hoveredVideoURLForTesting == nil)
+
+        clipView.scroll(to: NSPoint(x: 0, y: 20))
+        deferredProvider.complete(
+            requestAt: 0,
+            image: makeSolidImage(size: NSSize(width: 80, height: 40))
+        )
+
+        #expect(fixture.view.hoveredVideoURLForTesting == nil)
+        #expect(fixture.view.playButtonFrame(at: 0) == nil)
+    }
+
+    @Test("hover follows a video URL across reordered cells and clears when removed")
+    func hoverReconcilesByURLAfterRefresh() throws {
+        let provider = ImmediateThumbnailProvider()
+        let fixture = try ZoneFilesViewFixture(fileCount: 0, thumbnailProvider: provider)
+        let video = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/reordered.mov"),
+            displayName: "reordered.mov",
+            category: .video
+        )
+        let image = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/reordered.png"),
+            displayName: "reordered.png",
+            category: .image
+        )
+        fixture.view.setFiles([video, image])
+        fixture.view.layoutSubtreeIfNeeded()
+        let initialFrame = try #require(fixture.view.fileFrame(at: 0))
+        fixture.view.updateHoveredVideoForTesting(at: NSPoint(
+            x: initialFrame.midX,
+            y: initialFrame.midY
+        ))
+
+        fixture.view.setFiles([image, video])
+        fixture.view.layoutSubtreeIfNeeded()
+
+        #expect(fixture.view.hoveredVideoURLForTesting == video.url)
+        #expect(fixture.view.playButtonFrame(at: 0) == nil)
+        #expect(fixture.view.playButtonFrame(at: 1) != nil)
+
+        fixture.view.setFiles([image])
+        fixture.view.layoutSubtreeIfNeeded()
+        #expect(fixture.view.hoveredVideoURLForTesting == nil)
+    }
+
+    @Test("hover drawing changes only pixels around the video thumbnail center")
+    func hoverDrawsPlayButtonNearThumbnailCenter() throws {
+        let provider = ImmediateThumbnailProvider(
+            image: makeSolidImage(size: NSSize(width: 80, height: 40))
+        )
+        let fixture = try ZoneFilesViewFixture(fileCount: 0, thumbnailProvider: provider)
+        let video = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/drawing.mov"),
+            displayName: "drawing.mov",
+            category: .video
+        )
+        fixture.view.setFiles([video])
+        fixture.view.layoutSubtreeIfNeeded()
+        let before = try fixture.renderedBitmap()
+        let fileFrame = try #require(fixture.view.fileFrame(at: 0))
+        fixture.view.updateHoveredVideoForTesting(at: NSPoint(
+            x: fileFrame.midX,
+            y: fileFrame.midY
+        ))
+        let after = try fixture.renderedBitmap()
+        let playFrame = try #require(fixture.view.playButtonFrame(at: 0))
+        let changedBounds = try #require(changedPixelBounds(from: before, to: after))
+
+        #expect(changedPixelCount(from: before, to: after) > 100)
+        #expect(playFrame.insetBy(dx: -3, dy: -3).contains(changedBounds))
+        #expect(abs(changedBounds.midX - playFrame.midX) < 3)
+        #expect(abs(changedBounds.midY - playFrame.midY) < 3)
+    }
+
+    @Test("play button selects the video and routes only that click to Quick Look")
+    func playButtonClickRoutesQuickLook() throws {
+        let provider = ImmediateThumbnailProvider()
+        let fixture = try ZoneFilesViewFixture(fileCount: 0, thumbnailProvider: provider)
+        let video = ZoneStoredFile(
+            url: URL(fileURLWithPath: "/tmp/quick-look.mov"),
+            displayName: "quick-look.mov",
+            category: .video
+        )
+        fixture.view.setFiles([video])
+        fixture.view.layoutSubtreeIfNeeded()
+        let fileFrame = try #require(fixture.view.fileFrame(at: 0))
+        fixture.view.updateHoveredVideoForTesting(at: NSPoint(
+            x: fileFrame.midX,
+            y: fileFrame.midY
+        ))
+        let playFrame = try #require(fixture.view.playButtonFrame(at: 0))
+        let panel = QuickLookPanelSpy(currentController: fixture.view)
+        fixture.view.quickLookPanelProvider = { panel }
+
+        fixture.click(at: NSPoint(x: playFrame.midX, y: playFrame.midY))
+
+        #expect(fixture.view.selectedFileURL == video.url)
+        #expect(panel.events.contains("reloadData"))
+        #expect(panel.events.contains("show"))
+
+        fixture.click(at: NSPoint(x: fileFrame.maxX - 2, y: fileFrame.midY))
+        #expect(fixture.view.selectedFileURL == video.url)
+        #expect(panel.events.filter { $0 == "reloadData" }.count == 1)
+        #expect(panel.events.filter { $0 == "show" }.count == 1)
+
+        var openedURL: URL?
+        fixture.view.onOpenFile = { openedURL = $0 }
+        fixture.click(
+            at: NSPoint(x: fileFrame.maxX - 2, y: fileFrame.midY),
+            clickCount: 2
+        )
+        #expect(openedURL == video.url)
+        #expect(panel.events.filter { $0 == "show" }.count == 1)
+    }
+
     @Test("inline rename starts on the title and escape cancels")
     func inlineRenameCancel() throws {
         let fixture = try ZoneFilesViewFixture(fileCount: 1)
@@ -1452,6 +1718,44 @@ private func changedPixelCount(
     return count
 }
 
+private func changedPixelBounds(
+    from first: NSBitmapImageRep,
+    to second: NSBitmapImageRep
+) -> NSRect? {
+    var minX = min(first.pixelsWide, second.pixelsWide)
+    var minY = min(first.pixelsHigh, second.pixelsHigh)
+    var maxX = -1
+    var maxY = -1
+    for y in 0..<min(first.pixelsHigh, second.pixelsHigh) {
+        for x in 0..<min(first.pixelsWide, second.pixelsWide) {
+            guard let firstColor = first.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
+                  let secondColor = second.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB)
+            else {
+                continue
+            }
+            let difference = abs(firstColor.redComponent - secondColor.redComponent)
+                + abs(firstColor.greenComponent - secondColor.greenComponent)
+                + abs(firstColor.blueComponent - secondColor.blueComponent)
+                + abs(firstColor.alphaComponent - secondColor.alphaComponent)
+            if difference > 0.08 {
+                minX = min(minX, x)
+                minY = min(minY, y)
+                maxX = max(maxX, x)
+                maxY = max(maxY, y)
+            }
+        }
+    }
+    guard maxX >= minX, maxY >= minY else {
+        return nil
+    }
+    return NSRect(
+        x: minX,
+        y: minY,
+        width: maxX - minX + 1,
+        height: maxY - minY + 1
+    )
+}
+
 @MainActor
 private func waitForMainQueue() async {
     await withCheckedContinuation { continuation in
@@ -1626,7 +1930,8 @@ private final class ZoneFilesViewFixture {
         fileCount: Int,
         layout: FinderDesktopIconLayout = .finderDefault,
         thumbnailProvider: ZoneFileThumbnailProviding? = nil,
-        backingScaleFactor: CGFloat? = nil
+        backingScaleFactor: CGFloat? = nil,
+        embeddedInScrollView: Bool = false
     ) throws {
         view = ZoneFilesView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
         if let thumbnailProvider {
@@ -1652,7 +1957,14 @@ private final class ZoneFilesViewFixture {
                 defer: false
             )
         }
-        window.contentView = view
+        if embeddedInScrollView {
+            let scrollView = NSScrollView(frame: view.frame)
+            scrollView.hasVerticalScroller = true
+            scrollView.documentView = view
+            window.contentView = scrollView
+        } else {
+            window.contentView = view
+        }
         view.setFiles(files, layout: layout)
         view.layoutSubtreeIfNeeded()
     }
